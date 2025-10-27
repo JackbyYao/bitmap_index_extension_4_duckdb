@@ -1,0 +1,81 @@
+#pragma once
+
+#include "index/bitmap_idx.hpp"
+
+#include "duckdb/execution/index/bound_index.hpp"
+#include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/execution/index/index_pointer.hpp"
+
+namespace duckdb {
+
+struct BitmapConfig {
+	idx_t dummy_data = 0;
+};
+
+class PhysicalOperator;
+
+class BitmapIndex final : public BoundIndex {
+public:
+	// The type name of the BitmapIndex
+	static constexpr auto TYPE_NAME = "BITMAP";
+
+public:
+	BitmapIndex(const string &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
+	           TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
+	           AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
+	           const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0);
+
+	//unique_ptr<Bitmap> tree;
+
+	unique_ptr<IndexScanState> InitializeScan() const;
+	idx_t Scan(IndexScanState &state, Vector &result) const;
+
+	static unique_ptr<BoundIndex> Create(CreateIndexInput &input) {
+		auto res = make_uniq<BitmapIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
+		                                 input.unbound_expressions, input.db, input.options, input.storage_info);
+		//boyuany: according to rtree, this is it?
+		throw NotImplementedException("BitmapIndex::Create() not implemented");
+		return std::move(res);
+	}
+
+	static PhysicalOperator &CreatePlan(PlanIndexInput &input);
+
+public:
+	//! Called when data is appended to the index. The lock obtained from InitializeLock must be held
+	ErrorData Append(IndexLock &lock, DataChunk &entries, Vector &row_identifiers) override;
+
+	//! Deletes all data from the index. The lock obtained from InitializeLock must be held
+	void CommitDrop(IndexLock &index_lock) override;
+	//! Delete a chunk of entries from the index. The lock obtained from InitializeLock must be held
+	void Delete(IndexLock &lock, DataChunk &entries, Vector &row_identifiers) override;
+	//! Insert a chunk of entries into the index
+	ErrorData Insert(IndexLock &lock, DataChunk &data, Vector &row_ids) override;
+
+	//! Serializes RTree memory to disk and returns the index storage information.
+	IndexStorageInfo SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) override;
+	//! Serializes RTree memory to the WAL and returns the index storage information.
+	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &options) override;
+
+	idx_t GetInMemorySize(IndexLock &state) override;
+
+	//! Merge another index into this index. The lock obtained from InitializeLock must be held, and the other
+	//! index must also be locked during the merge
+	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;
+
+	//! Traverses an RTreeIndex and vacuums the qualifying nodes. The lock obtained from InitializeLock must be held
+	void Vacuum(IndexLock &state) override;
+
+	//! Returns the string representation of the RTreeIndex, or only traverses and verifies the index
+	string VerifyAndToString(IndexLock &state, const bool only_verify) override;
+
+	//! Ensures that the node allocation counts match the node counts.
+	void VerifyAllocations(IndexLock &state) override;
+	void VerifyBuffers(IndexLock &l) override;
+
+	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
+	                                     DataChunk &input) override {
+		return "Constraint violation in Bitmap index";
+	}
+};
+
+} // namespace duckdb

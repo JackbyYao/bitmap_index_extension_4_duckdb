@@ -27,6 +27,17 @@ inline void BitmapIdxOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &s
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	
+	/*
+	Register by module
+	RegisterBitmapIndexOptimizer::Register(loader);
+	
+	BitmapIdxModule::RegisterIndex(loader);
+	BitmapIdxModule::RegisterIndexPragmas(loader);
+	BitmapIdxModule::RegisterIndexScan(loader);
+	BitmapIdxModule::RegisterIndexPlanScan(loader);
+	*/
+	
 	// Register a scalar function
 	auto bitmap_idx_scalar_function = ScalarFunction("bitmap_idx", {LogicalType::VARCHAR}, LogicalType::VARCHAR, BitmapIdxScalarFun);
 	loader.RegisterFunction(bitmap_idx_scalar_function);
