@@ -1,0 +1,23 @@
+# name: test/sql/bitmap_idx.test
+# description: test bitmap_idx extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT bitmap_idx('Sam');
+----
+Catalog Error: Scalar Function with name bitmap_idx does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require bitmap_idx
+
+# Confirm the extension works
+query I
+SELECT bitmap_idx('Sam');
+----
+BitmapIdx Sam 🐥
+
+query I
+SELECT bitmap_idx_openssl_version('Michael') ILIKE 'BitmapIdx Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
