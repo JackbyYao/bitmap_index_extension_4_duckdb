@@ -12,7 +12,7 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 // Bitmap Index Scan State
 //------------------------------------------------------------------------------
-class RTreeIndexScanState final : public IndexScanState {
+class BitmapIndexScanState final : public IndexScanState {
 public:
 	//BitmapBounds query_bounds;
 	//BitmapScanner scanner;

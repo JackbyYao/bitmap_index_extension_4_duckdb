@@ -1,6 +1,9 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "bitmap_idx_extension.hpp"
+#include "bitmap_idx_module.hpp"
+
+
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -28,15 +31,11 @@ inline void BitmapIdxOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &s
 
 static void LoadInternal(ExtensionLoader &loader) {
 	
-	/*
-	Register by module
-	RegisterBitmapIndexOptimizer::Register(loader);
+	BitmapIndexModule::RegisterIndex(loader);
+	BitmapIndexModule::RegisterIndexPragmas(loader);
+	BitmapIndexModule::RegisterIndexScan(loader);
+	BitmapIndexModule::RegisterIndexPlanScan(loader);
 	
-	BitmapIdxModule::RegisterIndex(loader);
-	BitmapIdxModule::RegisterIndexPragmas(loader);
-	BitmapIdxModule::RegisterIndexScan(loader);
-	BitmapIdxModule::RegisterIndexPlanScan(loader);
-	*/
 	
 	// Register a scalar function
 	auto bitmap_idx_scalar_function = ScalarFunction("bitmap_idx", {LogicalType::VARCHAR}, LogicalType::VARCHAR, BitmapIdxScalarFun);
