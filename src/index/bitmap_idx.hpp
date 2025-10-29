@@ -1,6 +1,7 @@
 #pragma once
 
 #include "index/bitmap_idx.hpp"
+//#include "index/bitmap_idx_table.hpp"
 
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
@@ -9,23 +10,21 @@
 namespace duckdb {
 
 struct BitmapConfig {
-	idx_t dummy_data = 0;
+	idx_t bitmap_cardinality = 0;
 };
 
 class PhysicalOperator;
 
 class BitmapIndex final : public BoundIndex {
 public:
-	// The type name of the BitmapIndex
 	static constexpr auto TYPE_NAME = "BITMAP";
-
 public:
 	BitmapIndex(const string &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
 	           TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
 	           AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
 	           const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0);
-
-	//unique_ptr<Bitmap> tree;
+	BitmapConfig bitmap_config;
+	//unique_ptr<BitmapTable> bitmap_table;
 
 	unique_ptr<IndexScanState> InitializeScan() const;
 	idx_t Scan(IndexScanState &state, Vector &result) const;
@@ -33,8 +32,7 @@ public:
 	static unique_ptr<BoundIndex> Create(CreateIndexInput &input) {
 		auto res = make_uniq<BitmapIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
 		                                 input.unbound_expressions, input.db, input.options, input.storage_info);
-		//boyuany: according to rtree, this is it?
-		throw NotImplementedException("BitmapIndex::Create() not implemented");
+		
 		return std::move(res);
 	}
 
@@ -62,10 +60,8 @@ public:
 	//! index must also be locked during the merge
 	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;
 
-	//! Traverses an RTreeIndex and vacuums the qualifying nodes. The lock obtained from InitializeLock must be held
 	void Vacuum(IndexLock &state) override;
 
-	//! Returns the string representation of the RTreeIndex, or only traverses and verifies the index
 	string VerifyAndToString(IndexLock &state, const bool only_verify) override;
 
 	//! Ensures that the node allocation counts match the node counts.
@@ -76,6 +72,11 @@ public:
 	                                     DataChunk &input) override {
 		return "Constraint violation in Bitmap index";
 	}
+
+	idx_t GetInMemorySize() const;
+	idx_t GetIndexSize() const;
+	idx_t GetCompressionRatio() const;
+	vector<string> GetDistinctValues() const;
 };
 
 } // namespace duckdb

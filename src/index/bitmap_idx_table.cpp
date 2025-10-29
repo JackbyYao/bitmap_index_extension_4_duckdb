@@ -1,10 +1,10 @@
 
 #include <fstream>
-// Lightweight, self-contained bitmap implementation using 64-bit words.
-// This implementation avoids external dependencies (fastbit/cubit) and
-// implements the methods declared in bitmap_idx_table.hpp.
 
 #include "bitmap_idx_table.hpp"
+
+#include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/storage/block_manager.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -20,10 +20,7 @@ bool run_merge = false;
 
 void merge_func(BaseTable *table, int begin, int range, Table_config *config, std::shared_timed_mutex *bitmap_mutex)
 {
-    // Minimal placeholder merge function. The original implementation used
-    // a background merge worker (cubit) with RCU; here we provide a simple
-    // loop that sleeps while run_merge_func is true. This keeps the symbol
-    // available without pulling external dependencies.
+
     (void)table;
     (void)begin;
     (void)range;
@@ -53,7 +50,7 @@ static void ensure_size(std::vector<uint64_t> &bm, uint64_t pos_bits) {
     if (bm.size() < words) bm.resize(words, 0);
 }
 
-BitmapTable::BitmapTable(Table_config *config) : BaseTable(config), number_of_rows(config ? config->n_rows : 0)
+BitmapTable::BitmapTable(duckdb::BlockManager &block_manager,Table_config *config) : BaseTable(config), number_of_rows(config ? config->n_rows : 0)
 {
     if (!config) {
         num_bitmaps = 0;
@@ -276,4 +273,33 @@ void BitmapTable::printUncompMemory()
 {
     // For this simple in-memory structure, compressed == uncompressed
     printMemory();
+}
+
+void BitmapTable::SetRowValue(uint64_t rowid, int to_val) {
+    std::lock_guard<std::shared_timed_mutex> guard(g_lock);
+    if (!config) return;
+    if (config->encoding == Table_config::EE) {
+        // clear any existing bit across all bitmaps at rowid
+        for (int i = 0; i < num_bitmaps; ++i) {
+            ensure_size(bitmaps[i], rowid + 1);
+            bitmaps[i][rowid / 64] &= ~(uint64_t(1) << (rowid % 64));
+        }
+        if (to_val >= 0 && to_val < num_bitmaps) {
+            ensure_size(bitmaps[to_val], rowid + 1);
+            bitmaps[to_val][rowid / 64] |= (uint64_t(1) << (rowid % 64));
+        }
+    } else if (config->encoding == Table_config::RE) {
+        // in RE, bits from val..end represent >= val. To set to_val, we need to
+        // set bits in [to_val, end) and clear others below.
+        for (int i = 0; i < num_bitmaps; ++i) ensure_size(bitmaps[i], rowid + 1);
+        for (int i = 0; i < num_bitmaps; ++i) {
+            if (i < to_val) {
+                bitmaps[i][rowid / 64] &= ~(uint64_t(1) << (rowid % 64));
+            } else {
+                bitmaps[i][rowid / 64] |= (uint64_t(1) << (rowid % 64));
+            }
+        }
+    }
+    // adjust number_of_rows if rowid extends beyond it
+    if (rowid >= number_of_rows) number_of_rows = rowid + 1;
 }

@@ -6,6 +6,7 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/main/database.hpp"
+//#include "index/bitmap_idx_table.hpp"
 
 namespace duckdb {
 
@@ -14,8 +15,7 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 class BitmapIndexScanState final : public IndexScanState {
 public:
-	//BitmapBounds query_bounds;
-	//BitmapScanner scanner;
+	;
 };
 
 //------------------------------------------------------------------------------
@@ -24,7 +24,7 @@ public:
 
 static BitmapConfig ParseOptions(const case_insensitive_map_t<Value> &options) {
 	BitmapConfig config = {};
-
+	//TODO : future expansion of any configs
 	return config;
 }
 
@@ -41,19 +41,32 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
     : BoundIndex(name, TYPE_NAME, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
 
 	if (index_constraint_type != IndexConstraintType::NONE) {
-		throw NotImplementedException("RTree indexes do not support unique or primary key constraints");
+		//we do not support unique or primary key because their high cardinality. 
+		throw NotImplementedException("Bitmap indexes do not support unique or primary key constraints");
 	}
 
-	// Create the configuration from the options
-	BitmapConfig config = ParseOptions(options);
-	throw NotImplementedException("BitmapIndex::Constructor() not implemented");
-	// Create the Bitmap
+	// configuration can be loaded here
+	BitmapConfig bitmap_config = ParseOptions(options);
+	this->bitmap_config.bitmap_cardinality = (int)estimated_cardinality;
+
+	assert(this->bitmap_config.bitmap_cardinality > 0 );
+
 	auto &block_manager = table_io_manager.GetIndexBlockManager();
+	// TODO : figure out the estimate size after we defined on the actual storage
+	// const auto max_alloc_size = 
+	throw NotImplementedException("TODO: estimate the bitmap size");
+	//TODO: this might need to be merged with BitmapConfig
+	//Table_config bitmap_table_config;
+	//bitmap_table_config.g_cardinality = this->bitmap_config.bitmap_cardinality;
+	// instantiate the table
+	//this->bitmap_table = make_uniq<BitmapTable>(block_manager,bitmap_table_config);
+	if(info.IsValid()){
+		;//TODO: is there any other things to be allocated?
+	}
 }
 
 unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
-	throw NotImplementedException("BitmapIndex::InitializeScan() not implemented");
-	return nullptr;
+	return make_uniq<BitmapIndexScanState>();
 }
 
 idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {
@@ -72,8 +85,8 @@ ErrorData BitmapIndex::Insert(IndexLock &lock, DataChunk &input, Vector &rowid_v
 }
 
 ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &appended_data, Vector &row_identifiers) {
-	
-	throw NotImplementedException("BitmapIndex::Append() not implemented");
+	// For our simple in-memory table, Append behaves like Insert: set values for provided row ids.
+	return Insert(lock, appended_data, row_identifiers);
 }
 
 void BitmapIndex::Delete(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
@@ -117,6 +130,22 @@ void BitmapIndex::VerifyAllocations(IndexLock &state) {
 void BitmapIndex::VerifyBuffers(IndexLock &l) {
 	throw NotImplementedException("BitmapIndex::VerifyBuffers() not implemented");
 }
+
+//custom functions for _pragma:
+
+idx_t BitmapIndex::GetInMemorySize() const {
+	throw NotImplementedException("BitmapIndex::GetInMemorySize() not implemented");
+};
+idx_t BitmapIndex::GetIndexSize() const {
+	throw NotImplementedException("BitmapIndex::GetIndexSize() not implemented");
+};
+idx_t BitmapIndex::GetCompressionRatio() const {
+	throw NotImplementedException("BitmapIndex::GetCompressionRatio() not implemented");
+};
+vector<string> BitmapIndex::GetDistinctValues() const {
+	throw NotImplementedException("BitmapIndex::GetDistinctValues() not implemented");
+};
+
 
 //------------------------------------------------------------------------------
 // Register Index Type

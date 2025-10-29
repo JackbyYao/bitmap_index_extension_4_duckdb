@@ -29,7 +29,7 @@ struct Table_config {
 
 class BaseTable {
 public:
-    explicit BaseTable(Table_config *config) : config(config), cardinality(config ? config->g_cardinality : 0) {}
+    BaseTable(Table_config *config) : config(config), cardinality(config->g_cardinality) {}
 
     Table_config *const config;
 
@@ -56,13 +56,13 @@ protected:
     }
 };
 
-void merge_func(BaseTable *table, int begin, int range, Table_config *config, std::shared_timed_mutex *bitmap_mutex = nullptr);
+//void merge_func(BaseTable *table, int begin, int range, Table_config *config, std::shared_timed_mutex *bitmap_mutex = nullptr);
 
-extern bool run_merge_func;
+//extern bool run_merge_func;
 
 class BitmapTable : public BaseTable {
 public:
-    explicit BitmapTable(Table_config *config);
+    BitmapTable(duckdb::BlockManager &block_manager,Table_config *config);
 
     int update(int tid, uint64_t rowid, int to_val) override;
     int remove(int tid, uint64_t rowid) override;
@@ -75,6 +75,13 @@ public:
     void printUncompMemory() override;
 
     int get_value(uint64_t rowid);
+
+    // Expose current number of rows.
+    uint64_t GetNumberOfRows() const { return number_of_rows; }
+
+    // Set the value at an arbitrary row (create/overwrite). This sets the bitmap bits
+    // for the requested value and clears other conflicting bits according to encoding.
+    void SetRowValue(uint64_t rowid, int to_val);
 
     // In-memory bitmap storage. Each bitmap is a vector of 64-bit words.
     // TODO could use other better implementations.
