@@ -1,7 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "bitmap_idx_extension.hpp"
-#include "bitmap_idx_module.hpp"
+#include "include/bitmap_idx_extension.hpp"
+#include "index/bitmap_idx_module.hpp"
 
 
 #include "duckdb.hpp"

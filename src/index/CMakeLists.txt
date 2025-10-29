@@ -1,6 +1,7 @@
 set(EXTENSION_SOURCES
         ${EXTENSION_SOURCES}
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx.cpp
+        #${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_table.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_create_logical.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_create_physical.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_plan_scan.cpp
