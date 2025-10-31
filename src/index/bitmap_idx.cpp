@@ -1,3 +1,5 @@
+#include <cassert>
+
 #include "index/bitmap_idx.hpp"
 #include "index/bitmap_idx_module.hpp"
 
