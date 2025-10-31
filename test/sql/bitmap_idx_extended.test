@@ -1,0 +1,60 @@
+# name: test/sql/bitmap_idx_extended.test
+# description: Extended tests for bitmap_idx extension
+# group: [sql]
+
+# Load the extension
+require bitmap_idx
+
+# Test 1: Empty string
+query I
+SELECT bitmap_idx('');
+----
+BitmapIdx  🐥
+
+# Test 2: Long string
+query I
+SELECT bitmap_idx('This is a very long string to test');
+----
+BitmapIdx This is a very long string to test 🐥
+
+# Test 3: Unicode characters
+query I
+SELECT bitmap_idx('你好世界');
+----
+BitmapIdx 你好世界 🐥
+
+# Test 4: Special characters
+query I
+SELECT bitmap_idx('test!@#$%^&*()');
+----
+BitmapIdx test!@#$%^&*() 🐥
+
+# Test 5: Multiple calls in single query
+query II
+SELECT bitmap_idx('first'), bitmap_idx('second');
+----
+BitmapIdx first 🐥	BitmapIdx second 🐥
+
+# Test 6: Using in WHERE clause
+statement ok
+CREATE TABLE test_table AS SELECT 'test' as name;
+
+query I
+SELECT bitmap_idx(name) FROM test_table WHERE name = 'test';
+----
+BitmapIdx test 🐥
+
+statement ok
+DROP TABLE test_table;
+
+# Test 7: OpenSSL version check
+query I
+SELECT bitmap_idx_openssl_version('') IS NOT NULL;
+----
+true
+
+# Test 8: OpenSSL version format
+query I
+SELECT bitmap_idx_openssl_version('test') LIKE 'BitmapIdx test, my linked OpenSSL version is OpenSSL%';
+----
+true
