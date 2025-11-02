@@ -1,7 +1,10 @@
+/**
+ * storage, locking, WAL, merge flows
+ */
+
 #pragma once
 
-#include "index/bitmap_idx.hpp"
-//#include "index/bitmap_idx_table.hpp"
+#include "index/bitmap_idx_table.hpp"
 
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
@@ -24,7 +27,8 @@ public:
 	           AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
 	           const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0);
 	BitmapConfig bitmap_config;
-	//unique_ptr<BitmapTable> bitmap_table;
+	Table_config table_config;
+	unique_ptr<BitmapTable> bitmap_table;
 
 	unique_ptr<IndexScanState> InitializeScan() const;
 	idx_t Scan(IndexScanState &state, Vector &result) const;
@@ -75,8 +79,8 @@ public:
 
 	idx_t GetInMemorySize() const;
 	idx_t GetIndexSize() const;
-	idx_t GetCompressionRatio() const;
-	vector<string> GetDistinctValues() const;
+		idx_t GetCompressionRatio() const;
+		std::vector<std::string> GetDistinctValues() const;
 };
 
 } // namespace duckdb

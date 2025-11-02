@@ -1,3 +1,6 @@
+/**
+ * walks catalog entries to find bitmap indexes
+ */
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
