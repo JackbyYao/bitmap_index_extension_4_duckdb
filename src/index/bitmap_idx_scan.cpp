@@ -186,7 +186,7 @@ static void BitmapScanSerialize(Serializer &serializer, const optional_ptr<Funct
 	serializer.WriteProperty(101, "schema", bind_data.table.schema.name);
 	serializer.WriteProperty(102, "table", bind_data.table.name);
 	serializer.WriteProperty(103, "index_name", bind_data.index.GetIndexName());
-    //TODO: do we have other property to write?
+	serializer.WriteProperty(104, "filter_value", bind_data.filter_value);
 
 }
 
@@ -219,7 +219,9 @@ static unique_ptr<FunctionData> BitmapScanDeserialize(Deserializer &deserializer
 		}
 		auto &bitmap_index = index.Cast<BitmapIndex>();
 		if (bitmap_index.GetIndexName() == index_name) {
-			result = make_uniq<BitmapIndexScanBindData>(duck_table, bitmap_index);
+			    // Read filter value from serialized properties (default to NULL Value if not present)
+				Value filter_value = deserializer.ReadPropertyWithExplicitDefault<Value>(104, "filter_value", Value());
+			    result = make_uniq<BitmapIndexScanBindData>(duck_table, bitmap_index, filter_value);
 			//TODO, if we add in BitmapScanSerialize(), we have to deserialize also here:
 			return true;
 		}
