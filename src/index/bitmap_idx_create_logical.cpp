@@ -35,12 +35,17 @@ void LogicalCreateBitmapIndex::ResolveTypes() {
 void LogicalCreateBitmapIndex::ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) {
 	// DUMMY: 生成表的所有列绑定
 	bindings = LogicalOperator::GenerateColumnBindings(0, table.GetColumns().LogicalColumnCount());
+	// Visit the operator's expressions
+	LogicalOperatorVisitor::EnumerateExpressions(*this,
+	                                             [&](unique_ptr<Expression> *child) { res.VisitExpression(child); });
 }
 
+/*
+// Note: we allow NULL value so this function is not needed
 static PhysicalOperator &CreateNullFilter(PhysicalPlanGenerator &generator, const LogicalOperator &op,
                                           const vector<LogicalType> &types, ClientContext &context) {
 	throw NotImplementedException("CreateNullFilter() not implemented");
-}
+}*/
 
 
 PhysicalOperator &BitmapIndex::CreatePlan(PlanIndexInput &input) {
@@ -49,10 +54,29 @@ PhysicalOperator &BitmapIndex::CreatePlan(PlanIndexInput &input) {
 
 	auto &op = input.op;
 	auto &planner = input.planner;
+	/*
+	// generate a physical plan for the parallel index creation which consists of the following operators
+	// table scan - projection (for expression execution) - filter - order - create index
+	auto &table_scan = input.table_scan;
+    auto &context = input.context;
+	D_ASSERT(op.children.size() == 1);
+
+	if (op.unbound_expressions.size() != 1) {
+			throw BinderException("Bitmap index must be created on one column or expression.");
+		}
+	auto &expr = op.unbound_expressions[0];
+
+    if (expr->return_type.id() == LogicalTypeId::INVALID) {
+        throw BinderException("Bitmap index expression has invalid type.");
+	}
+	// projection to execute expressions on the key columns
+	vector<LogicalType> new_column_types;
+    vector<unique_ptr<Expression>> select_list;
+	// TODO: add filter operator/project/ORDERBY?
+    */
 
 	// DUMMY简化版本：直接创建PhysicalCreateBitmapIndex，不添加PROJECTION/FILTER/ORDER
 	// 实际实现应该像ART一样添加这些算子来准备数据
-
 	auto &create_idx = planner.Make<PhysicalCreateBitmapIndex>(
 		op,
 		op.table,
