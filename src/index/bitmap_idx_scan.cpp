@@ -118,7 +118,7 @@ TableFunction BitmapIndexScanFunction::GetFunction() {
 	func.get_bind_info = BitmapIndexScanBindInfo;
 	func.serialize = BitmapScanSerialize;
 	func.deserialize = BitmapScanDeserialize;
-	throw NotImplementedException("GetFunction() not implemented");
+	// DUMMY: 返回配置好的function，虽然所有回调都是dummy实现
 	return func;
 }
 

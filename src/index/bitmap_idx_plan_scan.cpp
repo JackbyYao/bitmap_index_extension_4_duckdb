@@ -1,21 +1,9 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/table/table_scan.hpp"
-#include "duckdb/optimizer/column_binding_replacer.hpp"
-#include "duckdb/optimizer/column_lifetime_analyzer.hpp"
-#include "duckdb/optimizer/matcher/expression_matcher.hpp"
-#include "duckdb/optimizer/matcher/function_matcher.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/optimizer/remove_unused_columns.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator_extension.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/main/database.hpp"
 
 #include "index/bitmap_idx_module.hpp"
@@ -30,24 +18,22 @@ public:
 		optimize_function = BitmapIndexScanOptimizer::Optimize;
 	}
 
-	static void RewriteIndexExpression(Index &index, LogicalGet &get, Expression &expr, bool &rewrite_possible) {
-		throw NotImplementedException("RewriteIndexExpression() not implemented");
-	}
-
-	static void RewriteIndexExpressionForFilter(Index &index, LogicalGet &get, unique_ptr<Expression> &expr,
-	                                            idx_t filter_idx, bool &rewrite_possible) {
-		throw NotImplementedException("RewriteIndexExpressionForFilter() not implemented");
-	}
-
 	static bool TryOptimize(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &plan,
 	                        unique_ptr<LogicalOperator> &root) {
-		throw NotImplementedException("TryOptimize() not implemented");
-	}
+		// TODO: 实现索引扫描优化
+		// 当前是框架实现，需要在以下功能完成后实现:
+		// 1. BitmapIndex::TryInitializeScan() - 用于检查索引是否支持给定的 filter
+		// 2. BitmapIndexScanFunction 的完整实现 - 用于执行索引扫描
+		// 3. 访问表索引列表的公共 API
 
-	static bool TryOptimizeGet(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &get_ptr,
-	                           unique_ptr<LogicalOperator> &root, optional_ptr<LogicalFilter> filter,
-	                           optional_idx filter_column_idx, unique_ptr<Expression> &filter_expr) {
-		throw NotImplementedException("TryOptimizeGet() not implemented");
+		// 基本思路:
+		// - 匹配 LogicalFilter -> LogicalGet 模式
+		// - 检查 Get 是否有 bitmap index
+		// - 检查 filter 表达式是否可以使用 bitmap index
+		// - 将 seq_scan 替换为 bitmap_index_scan
+		// - 将 filter 表达式下推到 index scan
+
+		return false;
 	}
 
 	static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,

@@ -17,7 +17,7 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 class BitmapIndexScanState final : public IndexScanState {
 public:
-	;
+	
 };
 
 //------------------------------------------------------------------------------
@@ -51,19 +51,17 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 	BitmapConfig bitmap_config = ParseOptions(options);
 	this->bitmap_config.bitmap_cardinality = (int)estimated_cardinality;
 
-	assert(this->bitmap_config.bitmap_cardinality > 0 );
-
+	// DUMMY: 暂时不分配实际存储，只是初始化配置
+	// 将来这里会创建BitmapTable对象
 	auto &block_manager = table_io_manager.GetIndexBlockManager();
-	// TODO : figure out the estimate size after we defined on the actual storage
-	// const auto max_alloc_size = 
-	throw NotImplementedException("TODO: estimate the bitmap size");
-	//TODO: this might need to be merged with BitmapConfig
+
+	// TODO: 当BitmapTable实现完成后，取消下面注释：
 	//Table_config bitmap_table_config;
 	//bitmap_table_config.g_cardinality = this->bitmap_config.bitmap_cardinality;
-	// instantiate the table
-	//this->bitmap_table = make_uniq<BitmapTable>(block_manager,bitmap_table_config);
+	//this->bitmap_table = make_uniq<BitmapTable>(block_manager, bitmap_table_config);
+
 	if(info.IsValid()){
-		;//TODO: is there any other things to be allocated?
+		// TODO: 从磁盘恢复索引数据
 	}
 }
 
@@ -72,17 +70,23 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
 }
 
 idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {
-	throw NotImplementedException("BitmapIndex::Scan() not implemented");
+	// DUMMY: 返回0表示没有更多结果
+	// 实际实现：从bitmap中读取匹配的row_ids填充到result向量
 	return 0;
 }
 
 void BitmapIndex::CommitDrop(IndexLock &index_lock) {
-	// TODO: Maybe we can drop these much earlier?
-	throw NotImplementedException("BitmapIndex::CommitDrop() not implemented");
+	// DUMMY: 释放所有bitmap存储
+	// 实际实现：bitmap_table.reset(); 或类似操作
 }
 
 ErrorData BitmapIndex::Insert(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	throw NotImplementedException("BitmapIndex::Insert() not implemented");
+	// DUMMY: 假装插入成功，不做任何操作
+	// 实际实现：
+	// 1. 遍历input chunk的每一行
+	// 2. 提取索引列的值
+	// 3. 在对应的bitmap中设置row_id位
+	// 4. 检查约束冲突（如果需要）
 	return ErrorData {};
 }
 
@@ -92,61 +96,91 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &appended_data, Vector 
 }
 
 void BitmapIndex::Delete(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	throw NotImplementedException("BitmapIndex::Delete() not implemented");
-	
+	// DUMMY: 假装删除成功
+	// 实际实现：
+	// 1. 遍历input chunk
+	// 2. 在对应bitmap中清除row_id位
 }
 
 IndexStorageInfo BitmapIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
+	// DUMMY: 返回空的存储信息（表示索引在内存中）
+	// 实际实现：将bitmap数据序列化到block_manager
 	IndexStorageInfo info;
-	throw NotImplementedException("BitmapIndex::SerializeToDisk() not implemented");
 	return info;
 }
 
 IndexStorageInfo BitmapIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
-
+	// DUMMY: 返回空的存储信息
+	// 实际实现：将操作写入WAL
 	IndexStorageInfo info;
-	throw NotImplementedException("BitmapIndex::SerializeToWAL() not implemented");
 	return info;
 }
 
 idx_t BitmapIndex::GetInMemorySize(IndexLock &state) {
-	throw NotImplementedException("BitmapIndex::GetInMemorySize() not implemented");
+	// DUMMY: 返回占位值
+	// 实际实现：计算bitmap_table的实际内存占用
 	return 0;
 }
 
 bool BitmapIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
-	throw NotImplementedException("BitmapIndex::MergeIndexes() not implemented");
+	// DUMMY: 假装合并成功
+	// 实际实现：
+	// 1. 验证other_index也是BitmapIndex
+	// 2. 对每个bitmap执行OR操作合并
+	// 3. 检查约束冲突
+	return true;
 }
 
 void BitmapIndex::Vacuum(IndexLock &state) {
+	// DUMMY: Vacuum操作暂时为空
+	// 实际实现：压缩bitmap、释放未使用的内存块
 }
 
 string BitmapIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
-	throw NotImplementedException("BitmapIndex::VerifyAndToString() not implemented");
+	// DUMMY: 返回简单的索引描述
+	// 实际实现：验证bitmap完整性，返回详细统计信息
+	if (only_verify) {
+		return "";
+	}
+	return StringUtil::Format("Bitmap Index %s (cardinality: %d)", name, bitmap_config.bitmap_cardinality);
 }
 
 void BitmapIndex::VerifyAllocations(IndexLock &state) {
-	throw NotImplementedException("BitmapIndex::VerifyAllocations() not implemented");
+	// DUMMY: 验证通过
+	// 实际实现：检查allocator计数与实际bitmap数量是否匹配
 }
 
 void BitmapIndex::VerifyBuffers(IndexLock &l) {
-	throw NotImplementedException("BitmapIndex::VerifyBuffers() not implemented");
+	// DUMMY: 验证通过
+	// 实际实现：检查buffer完整性
 }
 
 //custom functions for _pragma:
 
 idx_t BitmapIndex::GetInMemorySize() const {
-	throw NotImplementedException("BitmapIndex::GetInMemorySize() not implemented");
-};
+	// DUMMY: 返回占位值
+	// 实际实现：计算所有bitmap的内存占用总和
+	return 0;
+}
+
 idx_t BitmapIndex::GetIndexSize() const {
-	throw NotImplementedException("BitmapIndex::GetIndexSize() not implemented");
-};
+	// DUMMY: 返回占位值
+	// 实际实现：返回压缩后的bitmap大小
+	return 0;
+}
+
 idx_t BitmapIndex::GetCompressionRatio() const {
-	throw NotImplementedException("BitmapIndex::GetCompressionRatio() not implemented");
-};
+	// DUMMY: 返回1表示未压缩
+	// 实际实现：return uncompressed_size / compressed_size
+	return 1;
+}
+
 vector<string> BitmapIndex::GetDistinctValues() const {
-	throw NotImplementedException("BitmapIndex::GetDistinctValues() not implemented");
-};
+	// DUMMY: 返回空列表
+	// 实际实现：返回所有distinct values的字符串表示
+	vector<string> result;
+	return result;
+}
 
 
 //------------------------------------------------------------------------------

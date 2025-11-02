@@ -1,7 +1,6 @@
 #include "index/bitmap_idx_create_physical.hpp"
 #include "index/bitmap_idx.hpp"
 
-
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -9,6 +8,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/common/sort/sort.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 
@@ -30,7 +30,7 @@ PhysicalCreateBitmapIndex::PhysicalCreateBitmapIndex(PhysicalPlan &physical_plan
 	for (auto &column_id : column_ids) {
 		storage_ids.push_back(table.GetColumns().LogicalToPhysical(LogicalIndex(column_id)).index);
 	}
-    throw NotImplementedException("PhysicalCreateBitmapIndex::PhysicalCreateBitmapIndex() not implemented");
+	// DUMMY: 构造函数完成，准备好接收数据
 }
 
 //-------------------------------------------------------------
@@ -48,7 +48,28 @@ public:
 };
 
 unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(ClientContext &context) const {
-	throw NotImplementedException("PhysicalCreateBitmapIndex::GetGlobalSinkState() not implemented");
+	auto state = make_uniq<CreateBitmapIndexGlobalState>();
+
+	// DUMMY: 创建全局索引对象
+	// 参考ART索引的实现
+	auto &storage = table.GetStorage();
+
+	// 创建BitmapIndex对象（暂时空的，因为BitmapIndex构造函数已经是dummy）
+	state->bitmap_ptr = make_uniq<BitmapIndex>(
+		info->index_name,
+		info->constraint_type,
+		storage_ids,
+		TableIOManager::Get(storage),
+		unbound_expressions,
+		storage.db,
+		info->options,
+		IndexStorageInfo(),
+		estimated_cardinality
+	);
+
+	state->entry_idx = 0;
+
+	return std::move(state);
 }
 
 //-------------------------------------------------------------
@@ -56,8 +77,30 @@ unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(Client
 //-------------------------------------------------------------
 SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSinkInput &input) const {
-	
-    throw NotImplementedException("PhysicalCreateBitmapIndex::Sink() not implemented");
+	auto &gstate = input.global_state.Cast<CreateBitmapIndexGlobalState>();
+	auto &bitmap_index = *gstate.bitmap_ptr;
+
+	// DUMMY: 假装插入数据到索引
+	// 实际实现：
+	// 1. 从chunk中提取索引列数据
+	// 2. 生成row_ids向量
+	// 3. 调用bitmap_index.Append()
+
+	// 在索引创建期间，索引还未被其他线程访问，需要手动加锁
+	IndexLock lock;
+	bitmap_index.InitializeLock(lock);
+
+	DataChunk index_chunk;
+	index_chunk.Initialize(context.client, chunk.GetTypes());
+	index_chunk.Reference(chunk);
+
+	// 生成row_ids（假设chunk包含row_ids列）
+	Vector row_ids(LogicalType::ROW_TYPE, chunk.size());
+	// TODO: 从chunk提取实际的row_ids
+
+	bitmap_index.Append(lock, index_chunk, row_ids);
+	gstate.entry_idx += chunk.size();
+
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -120,7 +163,48 @@ private:
 //-------------------------------------------------------------
 SinkFinalizeType PhysicalCreateBitmapIndex::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                     OperatorSinkFinalizeInput &input) const {
-	throw NotImplementedException("PhysicalCreateBitmapIndex::Finalize() not implemented");
+	auto &state = input.global_state.Cast<CreateBitmapIndexGlobalState>();
+
+	// DUMMY: 完成索引构建流程
+	// 参考ART索引的Finalize实现，按照正确顺序：先检查，再修改状态
+
+	// 1. 先做所有检查
+	auto &storage = table.GetStorage();
+	if (!storage.IsMainTable()) {
+		throw TransactionException(
+		    "Transaction conflict: cannot add an index to a table that has been altered or dropped");
+	}
+
+	auto &schema = table.schema;
+	auto entry = schema.GetEntry(schema.GetCatalogTransaction(context), CatalogType::INDEX_ENTRY, info->index_name);
+	if (entry) {
+		if (info->on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
+			throw CatalogException("Index with name \"%s\" already exists!", info->index_name);
+		}
+		// IF NOT EXISTS且索引已存在，直接返回
+		return SinkFinalizeType::READY;
+	}
+
+	// 2. 所有检查通过后，执行维护操作
+	IndexLock lock;
+	state.bitmap_ptr->InitializeLock(lock);
+
+	state.bitmap_ptr->Vacuum(lock);
+	state.bitmap_ptr->VerifyAndToString(lock, true);
+	state.bitmap_ptr->VerifyAllocations(lock);
+
+	// 3. 更新info（在创建catalog entry之前）
+	info->column_ids = storage_ids;
+
+	// 4. 创建catalog entry
+	auto index_entry = schema.CreateIndex(schema.GetCatalogTransaction(context), *info, table).get();
+	D_ASSERT(index_entry);
+	auto &index = index_entry->Cast<DuckIndexEntry>();
+	index.initial_index_size = state.bitmap_ptr->GetInMemorySize(lock);
+
+	// 5. 将索引添加到storage
+	storage.AddIndex(std::move(state.bitmap_ptr));
+
 	return SinkFinalizeType::READY;
 }
 

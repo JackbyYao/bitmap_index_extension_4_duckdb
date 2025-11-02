@@ -24,17 +24,17 @@ LogicalCreateBitmapIndex::LogicalCreateBitmapIndex(unique_ptr<CreateIndexInfo> i
 		this->unbound_expressions.push_back(expr->Copy());
 	}
 	this->expressions = std::move(expressions_p);
-    throw NotImplementedException("LogicalCreateBitmapIndex::LogicalCreateBitmapIndex() not implemented");
+	// DUMMY: 构造函数完成
 }
 
 void LogicalCreateBitmapIndex::ResolveTypes() {
+	// DUMMY: 返回BIGINT类型（表示创建的索引数量，通常为1）
 	types.emplace_back(LogicalType::BIGINT);
-    throw NotImplementedException("LogicalCreateBitmapIndex::ResolveTypes() not implemented");
 }
 
 void LogicalCreateBitmapIndex::ResolveColumnBindings(ColumnBindingResolver &res, vector<ColumnBinding> &bindings) {
+	// DUMMY: 生成表的所有列绑定
 	bindings = LogicalOperator::GenerateColumnBindings(0, table.GetColumns().LogicalColumnCount());
-    throw NotImplementedException("LogicalCreateBitmapIndex::ResolveColumnBindings() not implemented");
 }
 
 static PhysicalOperator &CreateNullFilter(PhysicalPlanGenerator &generator, const LogicalOperator &op,
@@ -44,39 +44,60 @@ static PhysicalOperator &CreateNullFilter(PhysicalPlanGenerator &generator, cons
 
 
 PhysicalOperator &BitmapIndex::CreatePlan(PlanIndexInput &input) {
+	// DUMMY: 创建物理执行计划
+	// 参考ART的plan_art.cpp实现
 
-	throw NotImplementedException("BitmapIndex::CreatePlan() not implemented");
+	auto &op = input.op;
+	auto &planner = input.planner;
 
+	// DUMMY简化版本：直接创建PhysicalCreateBitmapIndex，不添加PROJECTION/FILTER/ORDER
+	// 实际实现应该像ART一样添加这些算子来准备数据
+
+	auto &create_idx = planner.Make<PhysicalCreateBitmapIndex>(
+		op,
+		op.table,
+		op.info->column_ids,
+		std::move(op.info),
+		std::move(op.unbound_expressions),
+		op.estimated_cardinality
+	);
+
+	// 将table_scan作为子节点
+	create_idx.children.push_back(input.table_scan);
+
+	return create_idx;
 }
 
-// TODO: Remove this
+// TODO: Remove this - 这个函数可能已废弃
 PhysicalOperator &LogicalCreateBitmapIndex::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	throw NotImplementedException("BitmapIndex::CreatePlan() not implemented");
+	// DUMMY: 这个函数可能不会被调用，因为我们使用IndexType::create_plan
+	throw NotImplementedException("LogicalCreateBitmapIndex::CreatePlan() should not be called");
 }
 
 void LogicalCreateBitmapIndex::Serialize(Serializer &writer) const {
+	// DUMMY: 序列化逻辑算子（用于计划缓存或分布式执行）
 	LogicalExtensionOperator::Serialize(writer);
 	writer.WritePropertyWithDefault(300, "operator_type", string(OPERATOR_TYPE_NAME));
 	writer.WritePropertyWithDefault<unique_ptr<CreateIndexInfo>>(400, "info", info);
 	writer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(401, "unbound_expressions", unbound_expressions);
-    throw NotImplementedException("LogicalCreateBitmapIndex::Serialize() not implemented");
 }
 
 unique_ptr<LogicalExtensionOperator> LogicalCreateBitmapIndex::Deserialize(Deserializer &reader) {
+	// DUMMY: 反序列化逻辑算子
 	auto create_info = reader.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(400, "info");
 	auto unbound_expressions =
 	    reader.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(401, "unbound_expressions");
 
 	auto info = unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(create_info));
 
-	// We also need to rebind the table
+	// 重新绑定表
 	auto &context = reader.Get<ClientContext &>();
 	const auto &catalog = info->catalog;
 	const auto &schema = info->schema;
 	const auto &table_name = info->table;
 	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table_name);
-    throw NotImplementedException("LogicalCreateBitmapIndex::Deserialize() not implemented");
-	// Return the new operator
+
+	// 返回新的算子
 	return make_uniq_base<LogicalExtensionOperator, LogicalCreateBitmapIndex>(
 	    std::move(info), std::move(unbound_expressions), table_entry);
 }
