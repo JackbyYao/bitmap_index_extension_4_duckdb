@@ -19,8 +19,8 @@
 namespace duckdb {
 
 BindInfo BitmapIndexScanBindInfo(const optional_ptr<FunctionData> bind_data_p) {
-	//auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
-	throw NotImplementedException("BitmapIndexScanBindInfo() not implemented");
+	auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
+	return BindInfo(bind_data.table);
 }
 
 //-------------------------------------------------------------------------
@@ -43,15 +43,85 @@ struct BitmapIndexScanGlobalState final : public GlobalTableFunctionState {
 
 static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
-	throw NotImplementedException("BitmapIndexScanInitGlobal() not implemented");
-	return nullptr;
+	auto &bind_data = input.bind_data->Cast<BitmapIndexScanBindData>();
+	auto result = make_uniq<BitmapIndexScanGlobalState>();
+
+	// Setup the scan state for the local storage
+	auto &local_storage = LocalStorage::Get(context, bind_data.table.catalog);
+	result->column_ids.reserve(input.column_ids.size());
+
+	// Figure out the storage column ids
+	for (auto &id : input.column_ids) {
+		storage_t col_id = id;
+		if (id != DConstants::INVALID_INDEX) {
+			col_id = bind_data.table.GetColumn(LogicalIndex(id)).StorageOid();
+		}
+		result->column_ids.emplace_back(col_id);
+	}
+
+	// Initialize local storage scan
+	result->local_storage_state.Initialize(result->column_ids, context, input.filters);
+	local_storage.InitializeScan(bind_data.table.GetStorage(),
+	                             result->local_storage_state.local_state,
+	                             input.filters);
+
+	// Initialize the scan state for the index
+	// Note: this would call BitmapIndex::InitializeScan()
+	result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan();
+
+	// Early out if there is nothing to project
+	if (!input.CanRemoveFilterColumns()) {
+		return std::move(result);
+	}
+	// We need this to project out what we scan from the underlying table.
+	result->projection_ids = input.projection_ids;
+
+	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
+	const auto &columns = duck_table.GetColumns();
+
+	vector<LogicalType> scanned_types;
+	for (const auto &col_idx : input.column_indexes) {
+		if (col_idx.IsRowIdColumn()) {
+			scanned_types.emplace_back(LogicalType::ROW_TYPE);
+		} else {
+			scanned_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
+		}
+	}
+	result->all_columns.Initialize(context, scanned_types);
+
+	return std::move(result);
 }
 
 //-------------------------------------------------------------------------
 // Execute
 //-------------------------------------------------------------------------
 static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    throw NotImplementedException("BitmapIndexScanExecute() not implemented");
+    auto &bind_data = data_p.bind_data->Cast<BitmapIndexScanBindData>();
+	auto &state = data_p.global_state->Cast<BitmapIndexScanGlobalState>();
+	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+
+	// Scan the index for row id's
+	auto row_count = bind_data.index.Cast<BitmapIndex>().Scan(*state.index_state, state.row_ids);
+	if (row_count == 0) {
+		// No more matching rows
+		output.SetCardinality(0);
+		return;
+	}
+
+	// Fetch the data from the local storage given the row ids
+	if (state.projection_ids.empty()) {
+		// Directly fetch columns into output
+		bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids,
+		                                   state.row_ids, row_count, state.fetch_state);
+		return;
+	}
+
+	// Otherwise, we need to first fetch into our scan chunk, and then project out the result
+	state.all_columns.Reset();
+	bind_data.table.GetStorage().Fetch(transaction, state.all_columns, state.column_ids,
+	                                   state.row_ids, row_count, state.fetch_state);
+
+	output.ReferenceColumns(state.all_columns, state.projection_ids);
 }
 
 //-------------------------------------------------------------------------
@@ -59,22 +129,39 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 //-------------------------------------------------------------------------
 static unique_ptr<BaseStatistics> BitmapIndexScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
                                                            column_t column_id) {
-	throw NotImplementedException("BitmapIndexScanStatistics() not implemented");
-	return nullptr;
+	auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
+	auto &local_storage = LocalStorage::Get(context, bind_data.table.catalog);
+
+	if (local_storage.Find(bind_data.table.GetStorage())) {
+		// we don't emit any statistics for tables that have outstanding transaction-local data
+		return nullptr;
+	}
+
+	return bind_data.table.GetStatistics(context, column_id);
 }
 
 //-------------------------------------------------------------------------
 // Dependency
 //-------------------------------------------------------------------------
 void BitmapIndexScanDependency(LogicalDependencyList &entries, const FunctionData *bind_data_p) {
-    throw NotImplementedException("BitmapIndexScanDependency() not implemented");
+    auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
+	entries.AddDependency(bind_data.table);
+
+	// TODO: Add dependency to index here?
 }
 
 //-------------------------------------------------------------------------
 // Cardinality
 //-------------------------------------------------------------------------
 unique_ptr<NodeStatistics> BitmapIndexScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
-	throw NotImplementedException("BitmapIndexScanCardinality() not implemented");
+	auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
+	auto &local_storage = LocalStorage::Get(context, bind_data.table.catalog);
+	const auto &storage = bind_data.table.GetStorage();
+
+	// TODO: do we have to implement this function?
+	idx_t table_rows = storage.GetTotalRows();
+	idx_t estimated_cardinality = table_rows + local_storage.AddedRows(bind_data.table.GetStorage());
+	return make_uniq<NodeStatistics>(table_rows, estimated_cardinality);
 }
 
 //-------------------------------------------------------------------------
@@ -83,7 +170,9 @@ unique_ptr<NodeStatistics> BitmapIndexScanCardinality(ClientContext &context, co
 static InsertionOrderPreservingMap<string> BitmapIndexScanToString(TableFunctionToStringInput &input) {
 	D_ASSERT(input.bind_data);
 	InsertionOrderPreservingMap<string> result;
-	throw NotImplementedException("BitmapIndexScanToString() not implemented");
+	auto &bind_data = input.bind_data->Cast<BitmapIndexScanBindData>();
+	result["Table"] = bind_data.table.name;
+	result["Index"] = bind_data.index.GetIndexName();
 	return result;
 }
 
@@ -92,12 +181,58 @@ static InsertionOrderPreservingMap<string> BitmapIndexScanToString(TableFunction
 //-------------------------------------------------------------------------
 static void BitmapScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                const TableFunction &function) {
-	throw NotImplementedException("BitmapScanSerialize() not implemented");
+	auto &bind_data = bind_data_p->Cast<BitmapIndexScanBindData>();
+	serializer.WriteProperty(100, "catalog", bind_data.table.schema.catalog.GetName());
+	serializer.WriteProperty(101, "schema", bind_data.table.schema.name);
+	serializer.WriteProperty(102, "table", bind_data.table.name);
+	serializer.WriteProperty(103, "index_name", bind_data.index.GetIndexName());
+    //TODO: do we have other property to write?
+
 }
 
 static unique_ptr<FunctionData> BitmapScanDeserialize(Deserializer &deserializer, TableFunction &function) {
-	throw NotImplementedException("BitmapScanDeserialize() not implemented");
-	return nullptr;
+	auto &context = deserializer.Get<ClientContext &>();
+
+	const auto catalog = deserializer.ReadProperty<string>(100, "catalog");
+	const auto schema = deserializer.ReadProperty<string>(101, "schema");
+	const auto table = deserializer.ReadProperty<string>(102, "table");
+
+	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
+	if (catalog_entry.type != CatalogType::TABLE_ENTRY) {
+		throw SerializationException("Could not find table %s.%s in catalog %s", schema, table, catalog);
+	}
+
+	// Read index name
+	const auto index_name = deserializer.ReadProperty<string>(103, "index_name");
+
+	//TODO, if we add in BitmapScanSerialize(), we have to deserialize here:
+
+	auto &duck_table = catalog_entry.Cast<DuckTableEntry>();
+	auto &table_info = *catalog_entry.GetStorage().GetDataTableInfo();
+
+	unique_ptr<BitmapIndexScanBindData> result = nullptr;
+
+	table_info.BindIndexes(context, BitmapIndex::TYPE_NAME);
+	table_info.GetIndexes().Scan([&](Index &index) {
+		if (!index.IsBound() || BitmapIndex::TYPE_NAME != index.GetIndexType()) {
+			return false;
+		}
+		auto &bitmap_index = index.Cast<BitmapIndex>();
+		if (bitmap_index.GetIndexName() == index_name) {
+			result = make_uniq<BitmapIndexScanBindData>(duck_table, bitmap_index);
+			//TODO, if we add in BitmapScanSerialize(), we have to deserialize also here:
+			return true;
+		}
+		return false;
+	});
+
+	if (!result) {
+		throw SerializationException("Could not find bitmap index %s on table %s.%s",
+		                             index_name, schema, table);
+	}
+
+	return std::move(result);
+
 }
 
 //-------------------------------------------------------------------------
@@ -118,7 +253,6 @@ TableFunction BitmapIndexScanFunction::GetFunction() {
 	func.get_bind_info = BitmapIndexScanBindInfo;
 	func.serialize = BitmapScanSerialize;
 	func.deserialize = BitmapScanDeserialize;
-	// DUMMY: 返回配置好的function，虽然所有回调都是dummy实现
 	return func;
 }
 
