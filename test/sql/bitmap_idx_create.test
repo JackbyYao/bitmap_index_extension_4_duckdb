@@ -1,0 +1,84 @@
+# name: test/sql/bitmap_idx_create.test
+# description: test bitmap index creation (dummy implementation)
+# group: [sql]
+
+require bitmap_idx
+
+# 测试1: 创建测试表
+statement ok
+CREATE TABLE test_table (
+    id INTEGER,
+    status VARCHAR,
+    category VARCHAR
+);
+
+# 测试2: 插入测试数据
+statement ok
+INSERT INTO test_table VALUES
+    (1, 'active', 'A'),
+    (2, 'inactive', 'B'),
+    (3, 'active', 'A'),
+    (4, 'pending', 'C'),
+    (5, 'active', 'B');
+
+# 测试3: 创建bitmap索引（这会调用我们的dummy CreatePlan -> Sink -> Finalize）
+statement ok
+CREATE INDEX idx_status ON test_table USING BITMAP(status);
+
+# 测试4: 验证索引在catalog中
+query IIII
+SELECT catalog_name, schema_name, index_name, table_name
+FROM pragma_bitmap_index_info()
+WHERE index_name = 'idx_status';
+----
+memory	main	idx_status	test_table
+
+# 测试5: 创建第二个bitmap索引
+statement ok
+CREATE INDEX idx_category ON test_table USING BITMAP(category);
+
+# 测试6: 验证两个索引都存在
+query I
+SELECT COUNT(*) FROM pragma_bitmap_index_info();
+----
+2
+
+# 测试7: 测试IF NOT EXISTS（不应报错）
+statement ok
+CREATE INDEX IF NOT EXISTS idx_status ON test_table USING BITMAP(status);
+
+# 测试8: 尝试创建重复索引（应该报错）
+statement error
+CREATE INDEX idx_status ON test_table USING BITMAP(status);
+----
+Catalog Error: Index with name "idx_status" already exists!
+
+# 测试9: 创建多列索引（如果支持）
+statement ok
+CREATE INDEX idx_combined ON test_table USING BITMAP(status, category);
+
+# 测试10: 验证所有索引
+query I
+SELECT COUNT(*) FROM pragma_bitmap_index_info();
+----
+3
+
+# 测试11: DROP INDEX（测试CommitDrop）
+statement ok
+DROP INDEX idx_combined;
+
+# 测试12: 验证索引已删除
+query I
+SELECT COUNT(*) FROM pragma_bitmap_index_info();
+----
+2
+
+# 测试13: 清理
+statement ok
+DROP TABLE test_table;
+
+# 测试14: 验证所有索引都被清理
+query I
+SELECT COUNT(*) FROM pragma_bitmap_index_info();
+----
+0
