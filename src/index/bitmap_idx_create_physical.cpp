@@ -1,3 +1,7 @@
+/**
+ * Execution engine
+ */
+
 #include "index/bitmap_idx_create_physical.hpp"
 #include "index/bitmap_idx.hpp"
 
@@ -10,6 +14,7 @@
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/common/sort/sort.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 
 namespace duckdb {
@@ -90,15 +95,32 @@ SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataCh
 	IndexLock lock;
 	bitmap_index.InitializeLock(lock);
 
-	DataChunk index_chunk;
-	index_chunk.Initialize(context.client, chunk.GetTypes());
-	index_chunk.Reference(chunk);
+	D_ASSERT(chunk.ColumnCount() >= 1);
 
-	// 生成row_ids（假设chunk包含row_ids列）
-	Vector row_ids(LogicalType::ROW_TYPE, chunk.size());
-	// TODO: 从chunk提取实际的row_ids
+	// key columns occupy everything except the final rowid column
+	vector<LogicalType> key_types;
+	vector<column_t> key_column_ids;
+	const idx_t column_count = chunk.ColumnCount();
+	const idx_t rowid_col_idx = column_count - 1;
 
-	bitmap_index.Append(lock, index_chunk, row_ids);
+	key_types.reserve(rowid_col_idx);
+	key_column_ids.reserve(rowid_col_idx);
+	for (idx_t col_idx = 0; col_idx < rowid_col_idx; col_idx++) {
+		key_types.push_back(chunk.data[col_idx].GetType());
+		key_column_ids.push_back(col_idx);
+	}
+
+	if (key_types.size() != 1) {
+		throw NotImplementedException("Bitmap indexes currently support a single key column");
+	}
+
+	DataChunk key_chunk;
+	key_chunk.Initialize(context.client, key_types);
+	key_chunk.ReferenceColumns(chunk, key_column_ids);
+
+	auto &rowid_vector = chunk.data[rowid_col_idx];
+
+	bitmap_index.Append(lock, key_chunk, rowid_vector);
 	gstate.entry_idx += chunk.size();
 
 	return SinkResultType::NEED_MORE_INPUT;

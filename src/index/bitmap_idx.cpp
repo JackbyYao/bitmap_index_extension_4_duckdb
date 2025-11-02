@@ -2,13 +2,18 @@
 
 #include "index/bitmap_idx.hpp"
 #include "index/bitmap_idx_module.hpp"
+#include "index/bitmap_idx_table.hpp"
 
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/main/database.hpp"
-//#include "index/bitmap_idx_table.hpp"
+// #include "duckdb/common/types/unified_vector_format.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/exception.hpp"
 
 namespace duckdb {
 
@@ -17,7 +22,13 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 class BitmapIndexScanState final : public IndexScanState {
 public:
-	
+	BitmapIndexScanState(const BitmapTable &table_p, vector<row_t> matches_p)
+	    : table(table_p), matches(std::move(matches_p)) {
+	}
+
+	const BitmapTable &table;
+	vector<row_t> matches;
+	idx_t offset = 0;
 };
 
 //------------------------------------------------------------------------------
@@ -48,17 +59,14 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 	}
 
 	// configuration can be loaded here
-	BitmapConfig bitmap_config = ParseOptions(options);
-	this->bitmap_config.bitmap_cardinality = (int)estimated_cardinality;
+	bitmap_config = ParseOptions(options);
+	bitmap_config.bitmap_cardinality = MaxValue<idx_t>(1, estimated_cardinality);
 
-	// DUMMY: 暂时不分配实际存储，只是初始化配置
-	// 将来这里会创建BitmapTable对象
-	auto &block_manager = table_io_manager.GetIndexBlockManager();
+	table_config.encoding = Table_config::EE;
+	table_config.g_cardinality = static_cast<int>(bitmap_config.bitmap_cardinality);
+	table_config.n_rows = 0;
 
-	// TODO: 当BitmapTable实现完成后，取消下面注释：
-	//Table_config bitmap_table_config;
-	//bitmap_table_config.g_cardinality = this->bitmap_config.bitmap_cardinality;
-	//this->bitmap_table = make_uniq<BitmapTable>(block_manager, bitmap_table_config);
+	bitmap_table = make_uniq<BitmapTable>(&table_config);
 
 	if(info.IsValid()){
 		// TODO: 从磁盘恢复索引数据
@@ -66,40 +74,126 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 }
 
 unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
-	return make_uniq<BitmapIndexScanState>();
+	if (!bitmap_table) {
+		return nullptr;
+	}
+	// DUMMY implementation: gather all row_ids currently present
+	vector<row_t> matches;
+	bitmap_table->ForEachValue([&](row_t row_id, idx_t /*value*/) {
+		matches.push_back(row_id);
+		return true;
+	});
+	return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
 }
 
 idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {
-	// DUMMY: 返回0表示没有更多结果
-	// 实际实现：从bitmap中读取匹配的row_ids填充到result向量
-	return 0;
+	auto &scan_state = state.Cast<BitmapIndexScanState>();
+	auto row_ids = FlatVector::GetData<row_t>(result);
+	idx_t count = 0;
+	while (scan_state.offset < scan_state.matches.size() && count < STANDARD_VECTOR_SIZE) {
+		row_ids[count++] = scan_state.matches[scan_state.offset++];
+	}
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	return count;
 }
 
 void BitmapIndex::CommitDrop(IndexLock &index_lock) {
-	// DUMMY: 释放所有bitmap存储
-	// 实际实现：bitmap_table.reset(); 或类似操作
+	bitmap_table.reset();
 }
 
 ErrorData BitmapIndex::Insert(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	// DUMMY: 假装插入成功，不做任何操作
-	// 实际实现：
-	// 1. 遍历input chunk的每一行
-	// 2. 提取索引列的值
-	// 3. 在对应的bitmap中设置row_id位
-	// 4. 检查约束冲突（如果需要）
+	return Append(lock, input, rowid_vec);
+}
+
+ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_identifiers) {
+	if (!bitmap_table) {
+		return ErrorData {};
+	}
+	if (entries.ColumnCount() != 1) {
+		throw NotImplementedException("Bitmap index currently supports single-column indexes");
+	}
+
+	auto count = entries.size();
+	if (count == 0) {
+		return ErrorData {};
+	}
+
+	auto &value_vector = entries.data[0]; // we only support single column index, so just pick data[0]
+	UnifiedVectorFormat value_data;
+	value_vector.ToUnifiedFormat(count, value_data);
+
+	UnifiedVectorFormat rowid_data;
+	row_identifiers.ToUnifiedFormat(count, rowid_data);
+	auto value_type = value_vector.GetType().id();
+
+	for (idx_t i = 0; i < count; i++) {
+		// which row
+		auto row_index = rowid_data.sel->get_index(i);
+		auto rowid_ptr = reinterpret_cast<row_t *>(rowid_data.data);
+		auto rowid = rowid_ptr[row_index];
+
+		// if value not valid, clear the bitmap for that row
+		if (!value_data.validity.RowIsValid(value_data.sel->get_index(i))) {
+			bitmap_table->ClearRow(rowid);
+			continue;
+		}
+
+		// set the bitmap for that row
+		idx_t physical_index = value_data.sel->get_index(i);
+		int64_t value = 0;
+		switch (value_type) {
+		case LogicalTypeId::BOOLEAN:
+		case LogicalTypeId::TINYINT:
+			value = reinterpret_cast<int8_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::UTINYINT:
+			value = reinterpret_cast<uint8_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::SMALLINT:
+			value = reinterpret_cast<int16_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::USMALLINT:
+			value = reinterpret_cast<uint16_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::INTEGER:
+			value = reinterpret_cast<int32_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::UINTEGER:
+			value = reinterpret_cast<uint32_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::BIGINT:
+			value = reinterpret_cast<int64_t *>(value_data.data)[physical_index];
+			break;
+		case LogicalTypeId::UBIGINT:
+			value = static_cast<int64_t>(reinterpret_cast<uint64_t *>(value_data.data)[physical_index]);
+			break;
+		default:
+			throw NotImplementedException("Bitmap index currently supports only integer-like types");
+		}
+
+		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
+			throw OutOfRangeException("Bitmap index value %lld exceeds 32-bit storage bounds", value);
+		}
+		bitmap_table->SetRowValue(rowid, static_cast<int32_t>(value));
+	}
 	return ErrorData {};
 }
 
-ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &appended_data, Vector &row_identifiers) {
-	// For our simple in-memory table, Append behaves like Insert: set values for provided row ids.
-	return Insert(lock, appended_data, row_identifiers);
-}
-
-void BitmapIndex::Delete(IndexLock &lock, DataChunk &input, Vector &rowid_vec) {
-	// DUMMY: 假装删除成功
-	// 实际实现：
-	// 1. 遍历input chunk
-	// 2. 在对应bitmap中清除row_id位
+void BitmapIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &rowid_vec) {
+	if (!bitmap_table) {
+		return;
+	}
+	auto count = entries.size();
+	if (count == 0) {
+		return;
+	}
+	UnifiedVectorFormat rowid_data;
+	rowid_vec.ToUnifiedFormat(count, rowid_data);
+	for (idx_t i = 0; i < count; i++) {
+		auto row_index = rowid_data.sel->get_index(i);
+		auto rowid = reinterpret_cast<row_t *>(rowid_data.data)[row_index];
+		bitmap_table->ClearRow(rowid);
+	}
 }
 
 IndexStorageInfo BitmapIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
@@ -117,9 +211,10 @@ IndexStorageInfo BitmapIndex::SerializeToWAL(const case_insensitive_map_t<Value>
 }
 
 idx_t BitmapIndex::GetInMemorySize(IndexLock &state) {
-	// DUMMY: 返回占位值
-	// 实际实现：计算bitmap_table的实际内存占用
-	return 0;
+	if (!bitmap_table) {
+		return 0;
+	}
+	return bitmap_table->GetMemoryUsageBytes();
 }
 
 bool BitmapIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
@@ -132,54 +227,50 @@ bool BitmapIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 }
 
 void BitmapIndex::Vacuum(IndexLock &state) {
-	// DUMMY: Vacuum操作暂时为空
-	// 实际实现：压缩bitmap、释放未使用的内存块
 }
 
 string BitmapIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
-	// DUMMY: 返回简单的索引描述
-	// 实际实现：验证bitmap完整性，返回详细统计信息
 	if (only_verify) {
 		return "";
 	}
-	return StringUtil::Format("Bitmap Index %s (cardinality: %d)", name, bitmap_config.bitmap_cardinality);
+	idx_t values = bitmap_table ? bitmap_table->GetDistinctValues().size() : 0;
+	return StringUtil::Format("Bitmap Index %s (indexed values: %llu)", name, values);
 }
 
 void BitmapIndex::VerifyAllocations(IndexLock &state) {
-	// DUMMY: 验证通过
-	// 实际实现：检查allocator计数与实际bitmap数量是否匹配
 }
 
 void BitmapIndex::VerifyBuffers(IndexLock &l) {
-	// DUMMY: 验证通过
-	// 实际实现：检查buffer完整性
 }
 
 //custom functions for _pragma:
 
 idx_t BitmapIndex::GetInMemorySize() const {
-	// DUMMY: 返回占位值
-	// 实际实现：计算所有bitmap的内存占用总和
-	return 0;
+	if (!bitmap_table) {
+		return 0;
+}
+	return bitmap_table->GetMemoryUsageBytes();
 }
 
 idx_t BitmapIndex::GetIndexSize() const {
-	// DUMMY: 返回占位值
-	// 实际实现：返回压缩后的bitmap大小
-	return 0;
+	if (!bitmap_table) {
+		return 0;
+	}
+	return bitmap_table->GetTotalBitSize();
 }
 
 idx_t BitmapIndex::GetCompressionRatio() const {
-	// DUMMY: 返回1表示未压缩
-	// 实际实现：return uncompressed_size / compressed_size
-	return 1;
+	if (!bitmap_table) {
+		return 1;
+	}
+	return bitmap_table->GetCompressionRatio();
 }
 
-vector<string> BitmapIndex::GetDistinctValues() const {
-	// DUMMY: 返回空列表
-	// 实际实现：返回所有distinct values的字符串表示
-	vector<string> result;
-	return result;
+std::vector<std::string> BitmapIndex::GetDistinctValues() const {
+	if (!bitmap_table) {
+		return {};
+	}
+	return bitmap_table->GetDistinctValues();
 }
 
 
