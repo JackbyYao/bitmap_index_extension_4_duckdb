@@ -10,6 +10,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/optimizer/matcher/expression_matcher.hpp"
 
 #include "index/bitmap_idx.hpp"
 #include "index/bitmap_idx_module.hpp"
@@ -100,14 +101,14 @@ public:
 		// Accept wide variety of scalar types as first argument (not limited to geometry)
 		return true;
 	}
-
+	/*
 	// Extract a constant value that represents the lookup value. For IN or array-style, user must adapt.
 	// Returns true if we could obtain a constant value from the matched expression (bindings[2]).
 	static bool TryGetLookupValue(const Value &value, Value &out_value) {
 		// For simple equality the constant is already the lookup value
 		out_value = value;
 		return true;
-	}
+	}*/
 
 	
 	static bool TryOptimize(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &plan,
@@ -131,11 +132,37 @@ public:
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = op.Cast<LogicalGet>();
 			for (auto &entry : get.table_filters.filters) {
-				if (entry.second->filter_type != TableFilterType::EXPRESSION_FILTER) {
+				if (entry.second->filter_type != TableFilterType::CONSTANT_COMPARISON) { //Note: now only support constant lookups
 					continue;
 				}
-				auto &expr_filter = entry.second->Cast<ExpressionFilter>();
-				if (TryOptimizeGet(binder, context, plan, root, nullptr, entry.first, expr_filter.expr)) {
+				idx_t phys_col = entry.first;
+				const auto &column_ids = get.GetColumnIds();
+
+    			idx_t proj_idx = DConstants::INVALID_INDEX;
+    			for (idx_t i = 0; i < column_ids.size(); i++) {
+        			if (column_ids[i].GetPrimaryIndex() == phys_col) {
+            			proj_idx = i;
+            			break;
+        			}
+    			}
+				if (proj_idx == DConstants::INVALID_INDEX) {
+					// column not present in this LogicalGet's projection -> skip
+					continue;
+				}
+				unique_ptr<Expression> table_expr;
+
+				//auto &expr_filter = entry.second->Cast<ConstantFilter>();
+				auto &type = get.returned_types[entry.first]; // returned_types indexed by physical col id
+        		auto bound_colref = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, proj_idx));
+        		// synthesize an expression from the TableFilter
+       		 	table_expr = entry.second->ToExpression(*bound_colref);
+
+				if (!table_expr) {
+					// couldn't synthesize a bound expression -> skip
+					continue;
+				}
+				
+				if (TryOptimizeGet(binder, context, plan, root, nullptr, entry.first,table_expr)) {
 					return true;
 				}
 			}
@@ -148,6 +175,7 @@ public:
 	static bool TryOptimizeGet(Binder &binder, ClientContext &context, unique_ptr<LogicalOperator> &get_ptr,
 	                           unique_ptr<LogicalOperator> &root, optional_ptr<LogicalFilter> filter,
 	                           optional_idx filter_column_idx, unique_ptr<Expression> &filter_expr) {
+		
 		auto &get = get_ptr->Cast<LogicalGet>();
 		if (get.function.name != "seq_scan") {
 			return false;
@@ -166,9 +194,6 @@ public:
 		auto &duck_table = table.Cast<DuckTableEntry>();
 		auto &table_info = *table.GetStorage().GetDataTableInfo();
 		unique_ptr<BitmapIndexScanBindData> bind_data = nullptr;
-
-		// Bitmap-optimizable predicates: equality / IN. Adjust names to match your scalar function registry.
-		unordered_set<string> bitmap_predicates = {"=", "eq", "IN", "Contains"}; // adjust as needed
 
 		// Ensure indexes of type bitmap are bound and iterate
 		table_info.BindIndexes(context, BitmapIndex::TYPE_NAME);
@@ -192,30 +217,51 @@ public:
 				return false;
 			}
 
-			// Build a matcher that matches: FUNCTION(index_expr, constant)
-			FunctionExpressionMatcher matcher;
-			matcher.function = make_uniq<ManyFunctionMatcher>(bitmap_predicates);
-			matcher.expr_type = make_uniq<SpecificExpressionTypeMatcher>(ExpressionType::BOUND_FUNCTION);
-			matcher.policy = SetMatcher::Policy::UNORDERED;
-
-			// matcher: first child should equal index_expr, second should be a constant
-			matcher.matchers.push_back(make_uniq<ExpressionEqualityMatcher>(*index_expr));
-			matcher.matchers.push_back(make_uniq<ConstantExpressionMatcher>());
+			// Build a matcher that matches: (index_expr COMPARE_EQUAL constant)
+			ComparisonExpressionMatcher cmp_matcher;
+			cmp_matcher.policy = SetMatcher::Policy::UNORDERED;
+			cmp_matcher.matchers.push_back(make_uniq<ExpressionEqualityMatcher>(*index_expr));
+			cmp_matcher.matchers.push_back(make_uniq<ConstantExpressionMatcher>());
 
 			vector<reference<Expression>> bindings;
-			if (!matcher.Match(*filter_expr, bindings)) {
+
+			// Make a copy of the filter expression if we need to rewrite it for the index filter column
+			unique_ptr<Expression> filter_for_match = nullptr;
+			if (filter_column_idx.IsValid()) {
+				filter_for_match = filter_expr->Copy();
+				bool filter_rewrite_ok = true;
+				RewriteIndexExpressionForFilter(index_entry, get, filter_for_match, filter_column_idx.GetIndex(),
+				                                filter_rewrite_ok);
+				if (!filter_rewrite_ok) {
+					return false;
+				}
+			}
+
+			Expression *match_expr = filter_for_match ? filter_for_match.get() : filter_expr.get();
+
+			if (!cmp_matcher.Match(*match_expr, bindings)) {
 				// not a bitmap-optimizable predicate for this index
 				return false;
 			}
 
-			// Expect: bindings[0] = full function, bindings[1] = index_expr, bindings[2] = constant
-			// Extract the constant value
-			auto &const_expr = bindings[2].get().Cast<BoundConstantExpression>();
-			Value lookup_value = const_expr.value;
-			Value out_value;
-			if (!TryGetLookupValue(lookup_value, out_value)) {
+			// Find the constant child in the bindings
+			BoundConstantExpression *const_expr_ptr = nullptr;
+			for (auto &b : bindings) {
+				if (b.get().GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+					const_expr_ptr = &b.get().Cast<BoundConstantExpression>();
+					break;
+				}
+			}
+			if (!const_expr_ptr) {
 				return false;
 			}
+
+			Value out_value = const_expr_ptr->value;
+			//Value lookup_value = const_expr.value;
+			//Value out_value;
+			//if (!TryGetLookupValue(lookup_value, out_value)) {
+			//	return false;
+			//}
 
 			// Construct bind data: the bitmap index, the column index (or column name), and the lookup value
 			bind_data = make_uniq<BitmapIndexScanBindData>(duck_table, index_entry, out_value);
