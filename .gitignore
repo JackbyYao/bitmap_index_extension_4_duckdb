@@ -10,3 +10,4 @@ test/python/__pycache__/
 
 bitmap_idx
 .claude
+.out.txt
