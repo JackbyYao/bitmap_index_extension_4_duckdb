@@ -31,10 +31,10 @@ inline void BitmapIdxOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &s
 
 static void LoadInternal(ExtensionLoader &loader) {
 	
-	BitmapIndexModule::RegisterIndex(loader);
-	BitmapIndexModule::RegisterIndexPragmas(loader);
-	BitmapIndexModule::RegisterIndexScan(loader);
-	BitmapIndexModule::RegisterIndexPlanScan(loader);
+	BitmapIndexModule::RegisterIndex(loader); // index type
+	BitmapIndexModule::RegisterIndexPragmas(loader); // pragma table functions
+	BitmapIndexModule::RegisterIndexScan(loader); // index scan table function
+	BitmapIndexModule::RegisterIndexPlanScan(loader); // optimizer hook
 	
 	
 	// Register a scalar function
