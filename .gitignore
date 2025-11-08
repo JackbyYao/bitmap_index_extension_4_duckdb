@@ -7,7 +7,10 @@ testext
 test/python/__pycache__/
 .Rhistory
 .vscode
+vcpkg_installed
 
 bitmap_idx
 .claude
 .out.txt
+
+.clangd
