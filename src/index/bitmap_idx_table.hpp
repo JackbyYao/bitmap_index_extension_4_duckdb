@@ -113,6 +113,18 @@ public:
         }
     }
 
+
+    // Serialization result: metadata and raw bytes
+    struct SerializedData {
+        int32_t num_bitmaps;
+        int32_t encoding;
+        uint64_t number_of_rows;
+        vector<vector<char>> bitmap_data; // raw bytes after serialization
+    };
+
+    SerializedData Serialize() const;
+    void Deserialize(const SerializedData &data);
+
 protected:
     // Global read-write lock to protect the whole bitmap index.
     mutable std::mutex g_lock;

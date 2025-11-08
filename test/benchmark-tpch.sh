@@ -28,6 +28,38 @@ if [ ! -x "${DUCKDB_BIN}" ]; then
 fi
 
 # -----------------------------
+# Run baseline (no extension)
+# -----------------------------
+echo "Running TPC-H baseline (no extension)..."
+"${DUCKDB_BIN}" -unsigned <<SQL | tee "${OUT_BASELINE}"
+-- 1. Install and load the TPC-H extension (MANDATORY for baseline run too!)
+INSTALL tpch;
+LOAD tpch;
+
+-- 2. Generate data
+CALL dbgen(sf=0.05);
+--PRAGMA tpch_scale_factor=1;
+
+-- 3. Set configuration
+
+PRAGMA threads=12;
+
+-- 4. Run benchmark (using now() instead of current_timestamp())
+SELECT now(), '--- TPC-H baseline ---';
+
+-- NOTE: As above, verify 'benchmark' function availability.
+PRAGMA tpch(4);
+SELECT now(), '--- TPC-H baseline ---';
+SQL
+
+# -----------------------------
+# Done
+# -----------------------------
+echo "Benchmark complete!"
+echo "With extension: ${OUT_WITH_EXT}"
+echo "Baseline:       ${OUT_BASELINE}"
+
+# -----------------------------
 # Run TPC-H with the extension
 # -----------------------------
 echo "Running TPC-H with extension '${EXTENSION_NAME}'..."
@@ -40,54 +72,24 @@ INSTALL tpch;
 LOAD tpch;
 
 -- 3. Generate data (assuming a new in-memory database instance)
-CALL dbgen(sf=0.01);
+CALL dbgen(sf=0.05);
 --PRAGMA tpch_scale_factor=1;
 
 CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP(L_SUPPKEY);
 
 -- 4. Set configuration
-PRAGMA threads=4;
+PRAGMA threads=12;
 
 -- 5. Run benchmark
 
 -- NOTE: Ensure your DuckDB build includes the 'benchmark' extension if needed,
 -- or replace with the actual TPC-H queries if 'benchmark' is not a valid function.
 SELECT now(), '--- TPC-H with ${EXTENSION_NAME} ---';
-PRAGMA tpch(6);
+PRAGMA tpch(4);
 SELECT now(), '--- TPC-H with ${EXTENSION_NAME} ---';
 
 -- 6. report the state of index:
 -- SELECT * FROM bitmap_index_dump(L_SUPPKEY_idx);
 SQL
 
-# -----------------------------
-# Run baseline (no extension)
-# -----------------------------
-echo "Running TPC-H baseline (no extension)..."
-"${DUCKDB_BIN}" -unsigned <<SQL | tee "${OUT_BASELINE}"
--- 1. Install and load the TPC-H extension (MANDATORY for baseline run too!)
-INSTALL tpch;
-LOAD tpch;
 
--- 2. Generate data
-CALL dbgen(sf=0.01);
---PRAGMA tpch_scale_factor=1;
-
--- 3. Set configuration
-
-PRAGMA threads=4;
-
--- 4. Run benchmark (using now() instead of current_timestamp())
-SELECT now(), '--- TPC-H baseline ---';
-
--- NOTE: As above, verify 'benchmark' function availability.
-PRAGMA tpch(6);
-SELECT now(), '--- TPC-H baseline ---';
-SQL
-
-# -----------------------------
-# Done
-# -----------------------------
-echo "Benchmark complete!"
-echo "With extension: ${OUT_WITH_EXT}"
-echo "Baseline:       ${OUT_BASELINE}"

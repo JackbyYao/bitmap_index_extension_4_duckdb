@@ -10,6 +10,15 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 
+#include <set>
+#include <map>
+#include <queue>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+
 namespace duckdb {
 
 struct BitmapConfig {
@@ -29,6 +38,34 @@ public:
 	BitmapConfig bitmap_config;
 	Table_config table_config;
 	unique_ptr<BitmapTable> bitmap_table;
+
+	// For serialization
+	unique_ptr<FixedSizeAllocator> bitmap_allocator;
+	// Track if index data has been modified since last serialization
+	bool index_dirty = false;
+	// Track which bitmaps have been modified for incremental serialization
+	std::set<int32_t> dirty_bitmaps;
+	// Map from bitmap index to its location in allocator (for incremental updates)
+	std::map<int32_t, IndexPointer> bitmap_locations;
+	// Mutex for thread-safe serialization
+	mutable std::mutex serialization_mutex;
+	// Background serialization thread
+	std::unique_ptr<std::thread> serialization_thread;
+	// Flag to stop background thread
+	std::atomic<bool> stop_serialization_thread{false};
+	// Queue for pending serialization operations
+	std::queue<std::function<void()>> serialization_queue;
+	std::mutex queue_mutex;
+	std::condition_variable queue_cv;
+	// Batch update buffer: accumulate changes before serializing
+	struct PendingUpdate {
+		int32_t bitmap_idx;
+		std::vector<char> bitmap_data;
+	};
+	std::vector<PendingUpdate> pending_updates;
+	std::mutex pending_mutex;
+	// Threshold for batch updates (number of pending updates before flushing)
+	static constexpr size_t BATCH_UPDATE_THRESHOLD = 100;
 
 	unique_ptr<IndexScanState> InitializeScan() const;
 	idx_t Scan(IndexScanState &state, Vector &result) const;
@@ -79,8 +116,16 @@ public:
 
 	idx_t GetInMemorySize() const;
 	idx_t GetIndexSize() const;
-		idx_t GetCompressionRatio() const;
-		std::vector<std::string> GetDistinctValues() const;
+	idx_t GetCompressionRatio() const;
+	std::vector<std::string> GetDistinctValues() const;
+
+private:
+	// Background serialization thread loop
+	void SerializationThreadLoop();
+	// Incremental serialization: serialize only dirty bitmaps
+	void SerializeDirtyBitmaps(QueryContext context, FixedSizeAllocator &allocator);
+	// Batch update: flush pending updates
+	void FlushPendingUpdates();
 };
 
 } // namespace duckdb

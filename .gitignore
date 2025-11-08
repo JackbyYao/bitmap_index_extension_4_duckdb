@@ -8,6 +8,7 @@ test/python/__pycache__/
 .Rhistory
 .vscode
 vcpkg_installed
+benchmark-results/
 
 bitmap_idx
 .claude

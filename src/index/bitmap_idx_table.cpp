@@ -343,3 +343,39 @@ std::vector<std::string> BitmapTable::GetDistinctValues() const {
     }
     return result;
 }
+
+BitmapTable::SerializedData BitmapTable::Serialize() const {
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    SerializedData result;
+    result.num_bitmaps = num_bitmaps;
+    result.encoding = static_cast<int32_t>(config ? config->encoding : Table_config::EE);
+    result.number_of_rows = number_of_rows;
+
+    // serialize each roaring bitmap
+    result.bitmap_data.resize(num_bitmaps);
+    for (int i = 0; i < num_bitmaps; i++) {
+        size_t serialized_size = bitmaps[i].getSizeInBytes();
+        result.bitmap_data[i].resize(serialized_size);
+        bitmaps[i].write(reinterpret_cast<char*>(result.bitmap_data[i].data()));
+    }
+
+    return result;
+}
+
+void BitmapTable::Deserialize(const SerializedData &data) {
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    num_bitmaps = data.num_bitmaps;
+    if (config) {
+        config->encoding = static_cast<Table_config::Encoding>(data.encoding);
+        config->g_cardinality = num_bitmaps;
+    }
+    number_of_rows = data.number_of_rows;
+
+    // deserialize each roaring bitmap
+    bitmaps.resize(num_bitmaps);
+    for (int i = 0; i < num_bitmaps; i++) {
+        bitmaps[i] = roaring::Roaring::read(reinterpret_cast<const char*>(data.bitmap_data[i].data()));
+    }
+}
