@@ -5,6 +5,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <roaring/roaring.hh>
 
 #include "duckdb/common/common.hpp"
 
@@ -85,8 +86,8 @@ public:
     void SetRowValue(uint64_t rowid, int to_val);
 
     // In-memory bitmap storage. Each bitmap is a vector of 64-bit words.
-    // TODO could use other better implementations.
-    std::vector<std::vector<uint64_t>> bitmaps;
+    // use roaring map
+    std::vector<roaring::Roaring> bitmaps;
     int num_bitmaps = 0;
 
     uint64_t GetMemoryUsageBytes() const;
@@ -102,25 +103,11 @@ public:
         std::lock_guard<std::mutex> guard(g_lock);
         for (int value = 0; value < num_bitmaps; value++) {
             const auto &bitmap = bitmaps[value];
-            for (idx_t word_idx = 0; word_idx < bitmap.size(); word_idx++) {
-                auto word = bitmap[word_idx];
-                while (word) {
-                    auto lsb = word & -word;
-#if defined(__GNUC__) || defined(__clang__)
-                    auto bit_offset = __builtin_ctzll(word);
-#else
-                    idx_t bit_offset = 0;
-                    uint64_t tmp = word;
-                    while ((tmp & 1) == 0) {
-                        tmp >>= 1;
-                        bit_offset++;
-                    }
-#endif
-                    row_t row = static_cast<row_t>(word_idx * 64 + bit_offset);
-                    if (!fun(row, static_cast<idx_t>(value))) {
-                        return;
-                    }
-                    word &= ~lsb;
+            // Use roaring iterator
+            for (auto it = bitmap.begin(); it != bitmap.end(); ++it) {
+                row_t row = static_cast<row_t>(*it);
+                if (!fun(row, static_cast<idx_t>(value))) {
+                    return;
                 }
             }
         }
