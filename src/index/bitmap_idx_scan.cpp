@@ -15,6 +15,8 @@
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/common/types/value.hpp"
+#include <string>
 
 namespace duckdb {
 
@@ -66,9 +68,8 @@ static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientCont
 	                             input.filters);
 
 	// Initialize the scan state for the index
-	// Note: this would call BitmapIndex::InitializeScan()
-	result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan();
-
+	//result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan();
+	result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan(&bind_data.filter_value);
 	// Early out if there is nothing to project
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(result);

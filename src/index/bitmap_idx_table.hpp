@@ -96,6 +96,9 @@ public:
     uint64_t GetCompressionRatio() const;
     std::vector<std::string> GetDistinctValues() const;
 
+    // Get all row ids that have the given value (thread-safe)
+    void GetRowsForValue(int value, std::vector<row_t> &out) const;
+
     void ClearRow(uint64_t rowid);
 
     template <class FUN>
