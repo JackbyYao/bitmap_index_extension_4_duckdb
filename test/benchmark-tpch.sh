@@ -39,7 +39,7 @@ run_query_with_extension() {
 LOAD '${EXTENSION_PATH}';
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=0.1);
+CALL dbgen(sf=0.001);
 
 -- Create bitmap indexes
 CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP(L_SUPPKEY);
@@ -69,7 +69,7 @@ run_query_without_extension() {
 .timer on
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=0.1);
+CALL dbgen(sf=0.001);
 
 PRAGMA tpch($q);
 .timer off
