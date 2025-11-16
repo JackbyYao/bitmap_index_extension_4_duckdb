@@ -123,28 +123,30 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
         return nullptr;
     }
 
-    // No filter or NULL filter -> default full-scan
-    if (!filter_value || filter_value->IsNull()) {
-        return InitializeScan(); // calls existing full-scan implementation
-    }
+	std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
+
+	// No filter or NULL filter -> default full-scan
+		if (!filter_value || filter_value->IsNull()) {
+			return InitializeScan(); // calls existing full-scan implementation
+		}
 
     try {
 		// Optimize for VARCHAR and integer-like types
 		auto type_id = filter_value->type().id();
 		if (type_id == LogicalTypeId::VARCHAR) {
-            // If index hasn't used the dictionary, fall back to full-scan
-            if (!UsesDictionary()) {
-                return InitializeScan();
-            }
-            // Resolve string -> id
-            const string sval = filter_value->ToString();
-            int id = LookupValueId(sval);
-            vector<row_t> matches;
-            if (id >= 0 && bitmap_table) {
-                bitmap_table->GetRowsForValue(id, matches);
-            }
-            // Return a scan state backed by the bitmap_table and the explicit matches
-            return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+			// If index hasn't used the dictionary, fall back to full-scan
+			if (!UsesDictionary()) {
+				return InitializeScan();
+			}
+			// Resolve string -> id
+			const string sval = filter_value->ToString();
+			int id = LookupValueId(sval);
+			vector<row_t> matches;
+			if (id >= 0 && bitmap_table) {
+				bitmap_table->GetRowsForValue(id, matches);
+			}
+			// Return a scan state backed by the bitmap_table and the explicit matches
+			return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
 		} else if (type_id == LogicalTypeId::BOOLEAN || type_id == LogicalTypeId::TINYINT ||
 				   type_id == LogicalTypeId::UTINYINT || type_id == LogicalTypeId::SMALLINT ||
 				   type_id == LogicalTypeId::USMALLINT || type_id == LogicalTypeId::INTEGER ||
@@ -180,10 +182,9 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 			// For other filter types, fall back to full-scan for now
 			return InitializeScan();
 		}
-    } catch (...) {
-        // On any failure, be conservative and return full-scan
-        return InitializeScan();
-    }
+	} catch (...) {
+		return InitializeScan();
+	}
 }
 
 idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {

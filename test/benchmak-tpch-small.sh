@@ -58,20 +58,52 @@ CALL dbgen(sf=0.001);
 
 -- Create bitmap indexes useful for TPC-H queries
 -- Only equality predicates, numeric + VARCHAR supported
---CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
---CREATE INDEX O_ORDERPRIORITY_idx ON ORDERS USING BITMAP (O_ORDERPRIORITY);
---CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP (O_ORDERSTATUS);
---CREATE INDEX S_NATIONKEY_idx ON SUPPLIER USING BITMAP (S_NATIONKEY);
---CREATE INDEX C_NATIONKEY_idx ON CUSTOMER USING BITMAP (C_NATIONKEY);
---CREATE INDEX P_TYPE_idx ON PART USING BITMAP (P_TYPE);
---CREATE INDEX PS_SUPPKEY_idx ON PARTSUPP USING BITMAP (PS_SUPPKEY);
---CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP (L_SUPPKEY);
---CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP (L_RETURNFLAG);
+CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
+CREATE INDEX O_ORDERPRIORITY_idx ON ORDERS USING BITMAP (O_ORDERPRIORITY);
+CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP (O_ORDERSTATUS);
+CREATE INDEX S_NATIONKEY_idx ON SUPPLIER USING BITMAP (S_NATIONKEY);
+CREATE INDEX C_NATIONKEY_idx ON CUSTOMER USING BITMAP (C_NATIONKEY);
+CREATE INDEX P_TYPE_idx ON PART USING BITMAP (P_TYPE);
+CREATE INDEX PS_SUPPKEY_idx ON PARTSUPP USING BITMAP (PS_SUPPKEY);
+CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP (L_SUPPKEY);
+CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP (L_RETURNFLAG);
 
 PRAGMA threads=8;
 
 SELECT now(), '--- TPC-H with bitmap extension ---';
-PRAGMA tpch(6);    -- example query
+-- EXPLAIN ANALYZE PRAGMA tpch(6);    -- example query
+EXPLAIN ANALYZE SELECT
+    c_custkey,
+    c_name,
+    SUM(l_extendedprice * (1 - l_discount)) AS revenue,
+    c_acctbal,
+    n_name,
+    c_address,
+    c_phone,
+    c_comment
+FROM
+    customer,
+    orders,
+    lineitem,
+    nation
+WHERE
+    c_custkey = o_custkey
+    AND l_orderkey = o_orderkey
+    AND l_returnflag = 'R'
+    AND o_orderdate >= DATE '1993-10-01' -- Starting date of the quarter
+    AND o_orderdate < DATE '1993-10-01' + INTERVAL '3' MONTH
+    AND c_nationkey = n_nationkey
+GROUP BY
+    c_custkey,
+    c_name,
+    c_acctbal,
+    c_phone,
+    n_name,
+    c_address,
+    c_comment
+ORDER BY
+    revenue DESC
+LIMIT 20;
 SELECT now(), '--- TPC-H with bitmap extension ---';
 SQL
 
@@ -87,7 +119,39 @@ CALL dbgen(sf=0.001);
 PRAGMA threads=8;
 
 SELECT now(), '--- baseline ---';
-PRAGMA tpch(6);
+--EXPLAIN ANALYZE PRAGMA tpch(6);
+EXPLAIN ANALYZE SELECT
+    c_custkey,
+    c_name,
+    SUM(l_extendedprice * (1 - l_discount)) AS revenue,
+    c_acctbal,
+    n_name,
+    c_address,
+    c_phone,
+    c_comment
+FROM
+    customer,
+    orders,
+    lineitem,
+    nation
+WHERE
+    c_custkey = o_custkey
+    AND l_orderkey = o_orderkey
+    AND l_returnflag = 'R'
+    AND o_orderdate >= DATE '1993-10-01' -- Starting date of the quarter
+    AND o_orderdate < DATE '1993-10-01' + INTERVAL '3' MONTH
+    AND c_nationkey = n_nationkey
+GROUP BY
+    c_custkey,
+    c_name,
+    c_acctbal,
+    c_phone,
+    n_name,
+    c_address,
+    c_comment
+ORDER BY
+    revenue DESC
+LIMIT 20;
 SELECT now(), '--- baseline ---';
 SQL
 
@@ -100,7 +164,7 @@ echo "----------------------------------------------"
 echo " Per-query benchmark 1..22"
 echo "----------------------------------------------"
 
-#11 , 21
+#10 , 21
 for q in {1..22}; do
     echo "Running Q${q} WITH extension..."
     timeout 120s "${DUCKDB_BIN}" ":memory:" <<EOF > "${WITH_DIR}/q${q}.out" 2>&1
@@ -113,13 +177,13 @@ CALL dbgen(sf=0.001);
 -- indexes (same as global run)
 CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
 CREATE INDEX O_ORDERPRIORITY_idx ON ORDERS USING BITMAP (O_ORDERPRIORITY);
---CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP (O_ORDERSTATUS);
+CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP (O_ORDERSTATUS);
 CREATE INDEX S_NATIONKEY_idx ON SUPPLIER USING BITMAP (S_NATIONKEY);
 CREATE INDEX C_NATIONKEY_idx ON CUSTOMER USING BITMAP (C_NATIONKEY);
 CREATE INDEX P_TYPE_idx ON PART USING BITMAP (P_TYPE);
 CREATE INDEX PS_SUPPKEY_idx ON PARTSUPP USING BITMAP (PS_SUPPKEY);
 CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP (L_SUPPKEY);
---CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP (L_RETURNFLAG);
+CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP (L_RETURNFLAG);
 
 PRAGMA threads=8;
 
