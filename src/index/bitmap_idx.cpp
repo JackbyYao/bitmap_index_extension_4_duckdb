@@ -227,6 +227,11 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 	row_identifiers.ToUnifiedFormat(count, rowid_data);
 	auto value_type = value_vector.GetType().id();
 
+	// Collect all updates for batch processing
+	std::vector<std::pair<uint64_t, int>> batch_updates;
+	batch_updates.reserve(count);
+	std::vector<uint64_t> rows_to_clear;
+
 	for (idx_t i = 0; i < count; i++) {
 		// which row
 		auto row_index = rowid_data.sel->get_index(i);
@@ -235,7 +240,7 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 
 		// if value not valid, clear the bitmap for that row
 		if (!value_data.validity.RowIsValid(value_data.sel->get_index(i))) {
-			bitmap_table->ClearRow(rowid);
+			rows_to_clear.push_back(rowid);
 			continue;
 		}
 
@@ -284,8 +289,19 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
 			throw OutOfRangeException("Bitmap index value %lld exceeds 32-bit storage bounds", value);
 		}
-		bitmap_table->SetRowValue(rowid, static_cast<int32_t>(value));
+		batch_updates.push_back({rowid, static_cast<int32_t>(value)});
 	}
+
+	// Process clears (use negative value to indicate clear in batch API)
+	for (uint64_t rowid : rows_to_clear) {
+		batch_updates.push_back({rowid, -1});
+	}
+
+	// Batch process all updates at once
+	if (!batch_updates.empty()) {
+		bitmap_table->SetRowValuesBatch(batch_updates);
+	}
+
 	return ErrorData {};
 }
 
