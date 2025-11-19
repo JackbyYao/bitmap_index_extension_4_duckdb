@@ -5,6 +5,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <roaring/roaring.hh>
 
 #include "duckdb/common/common.hpp"
@@ -85,10 +86,18 @@ public:
     // for the requested value and clears other conflicting bits according to encoding.
     void SetRowValue(uint64_t rowid, int to_val);
 
+    // Batch version: Set multiple row values at once for better performance
+    // Accepts a vector of (rowid, value) pairs
+    void SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> &updates);
+
     // In-memory bitmap storage. Each bitmap is a vector of 64-bit words.
     // use roaring map
     std::vector<roaring::Roaring> bitmaps;
     int num_bitmaps = 0;
+
+    // Fast lookup table for rowid -> value mapping (EE encoding only)
+    // This avoids scanning all bitmaps to find the current value of a rowid
+    std::unordered_map<uint64_t, int> rowid_to_value;
 
     uint64_t GetMemoryUsageBytes() const;
     uint64_t GetTotalBitSize() const;

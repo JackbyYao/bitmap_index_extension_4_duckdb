@@ -244,29 +244,282 @@ void BitmapTable::SetRowValue(uint64_t rowid, int to_val) {
         if (to_val >= 0) {
             EnsureBitmapForValue(to_val);
         }
-        // clear any existing bit across all bitmaps at rowid
-        for (int i = 0; i < num_bitmaps; ++i) {
-            bitmaps[i].remove(rowid);
+        // Use fast lookup table to find current value (O(1) instead of O(num_bitmaps))
+        int from_val = -1;
+        auto it = rowid_to_value.find(rowid);
+        if (it != rowid_to_value.end()) {
+            from_val = it->second;
         }
+        
+        // Only remove from the bitmap that actually contains rowid
+        if (from_val >= 0 && from_val < num_bitmaps) {
+            bitmaps[from_val].remove(rowid);
+            rowid_to_value.erase(rowid);  // Remove old mapping
+        }
+        // Add to target bitmap if valid
         if (to_val >= 0 && to_val < num_bitmaps) {
             bitmaps[to_val].add(rowid);
+            rowid_to_value[rowid] = to_val;  // Update mapping
+        } else if (to_val < 0) {
+            // If to_val is negative, remove from mapping
+            rowid_to_value.erase(rowid);
         }
     } else if (config->encoding == Table_config::RE) {
         if (to_val >= 0) {
             EnsureBitmapForValue(to_val);
         }
-        // in RE, bits from val..end represent >= val. To set to_val, we need to
-        // set bits in [to_val, end) and clear others below.
-        for (int i = 0; i < num_bitmaps; ++i) {
-            if (i < to_val) {
-                bitmaps[i].remove(rowid);
-            } else {
-                bitmaps[i].add(rowid);
+        // For RE encoding, we still need to find current value to optimize range operations
+        // Use lookup table if available, otherwise fall back to scanning
+        int from_val = -1;
+        auto it = rowid_to_value.find(rowid);
+        if (it != rowid_to_value.end()) {
+            from_val = it->second;
+        }
+        
+        if (from_val >= 0) {
+            // Only update the range that changed
+            int minv = std::min(from_val, to_val);
+            int maxv = std::max(from_val, to_val);
+            for (int i = minv; i <= maxv; ++i) {
+                if (i < to_val) {
+                    if (bitmaps[i].contains(rowid)) {
+                        bitmaps[i].remove(rowid);
+                    }
+                } else {
+                    if (!bitmaps[i].contains(rowid)) {
+                        bitmaps[i].add(rowid);
+                    }
+                }
             }
+        } else {
+            // No previous value, set all bits according to to_val
+            for (int i = 0; i < num_bitmaps; ++i) {
+                if (i < to_val) {
+                    if (bitmaps[i].contains(rowid)) {
+                        bitmaps[i].remove(rowid);
+                    }
+                } else {
+                    if (!bitmaps[i].contains(rowid)) {
+                        bitmaps[i].add(rowid);
+                    }
+                }
+            }
+        }
+        
+        // Update mapping for RE encoding
+        if (to_val >= 0) {
+            rowid_to_value[rowid] = to_val;
+        } else {
+            rowid_to_value.erase(rowid);
         }
     }
     // adjust number_of_rows if rowid extends beyond it
     if (rowid >= number_of_rows) number_of_rows = rowid + 1;
+}
+
+void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> &updates) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!config || updates.empty()) return;
+
+    // Ensure all required bitmaps exist
+    int max_value = -1;
+    for (const auto &update : updates) {
+        if (update.second >= 0 && update.second > max_value) {
+            max_value = update.second;
+        }
+    }
+    if (max_value >= 0) {
+        EnsureBitmapForValue(max_value);
+    }
+
+    if (config->encoding == Table_config::EE) {
+        // Optimized batch processing for EE encoding:
+        // 1. Group removes by from_value to reduce array access
+        // 2. Group adds by to_value to reduce array access
+        // 3. Cache bitmap references to avoid repeated array indexing
+        
+        // Map: from_value -> vector of rowids to remove
+        std::unordered_map<int, std::vector<uint64_t>> removes_by_value;
+        // Map: to_value -> vector of rowids to add
+        std::unordered_map<int, std::vector<uint64_t>> adds_by_value;
+        // Track rowids to remove from mapping
+        std::vector<uint64_t> rowids_to_clear;
+        
+        // First pass: collect all operations grouped by value
+        for (const auto &update : updates) {
+            uint64_t rowid = update.first;
+            int to_val = update.second;
+            
+            // Find current value using lookup table
+            int from_val = -1;
+            auto it = rowid_to_value.find(rowid);
+            if (it != rowid_to_value.end()) {
+                from_val = it->second;
+            }
+            
+            // Collect remove operation
+            if (from_val >= 0 && from_val < num_bitmaps) {
+                removes_by_value[from_val].push_back(rowid);
+                rowids_to_clear.push_back(rowid);
+            }
+            
+            // Collect add operation
+            if (to_val >= 0 && to_val < num_bitmaps) {
+                adds_by_value[to_val].push_back(rowid);
+            } else {
+                // Negative value means clear
+                if (from_val >= 0) {
+                    rowids_to_clear.push_back(rowid);
+                }
+            }
+            
+            // Update number_of_rows
+            if (rowid >= number_of_rows) {
+                number_of_rows = rowid + 1;
+            }
+        }
+        
+        // Second pass: batch remove operations (grouped by bitmap to reduce array access)
+        for (const auto &entry : removes_by_value) {
+            int value = entry.first;
+            const auto &rowids = entry.second;
+            // Cache bitmap reference to avoid repeated array access
+            auto &bitmap = bitmaps[value];
+            for (uint64_t rowid : rowids) {
+                bitmap.remove(rowid);
+            }
+        }
+        
+        // Third pass: batch add operations (grouped by bitmap to reduce array access)
+        for (const auto &entry : adds_by_value) {
+            int value = entry.first;
+            const auto &rowids = entry.second;
+            // Cache bitmap reference to avoid repeated array access
+            auto &bitmap = bitmaps[value];
+            for (uint64_t rowid : rowids) {
+                bitmap.add(rowid);
+                rowid_to_value[rowid] = value;
+            }
+        }
+        
+        // Update mapping: remove cleared rowids
+        for (uint64_t rowid : rowids_to_clear) {
+            // Only remove if not being added (check adds_by_value)
+            bool being_added = false;
+            for (const auto &entry : adds_by_value) {
+                const auto &rowids = entry.second;
+                if (std::find(rowids.begin(), rowids.end(), rowid) != rowids.end()) {
+                    being_added = true;
+                    break;
+                }
+            }
+            if (!being_added) {
+                rowid_to_value.erase(rowid);
+            }
+        }
+        
+    } else if (config->encoding == Table_config::RE) {
+        // Optimized batch processing for RE encoding:
+        // 1. Group operations by bitmap index to reduce array access
+        // 2. Use lookup table to find current values (O(1) lookup)
+        // 3. Only update the range that changed for each rowid
+        // 4. Cache bitmap references to avoid repeated array indexing
+        
+        // Map: bitmap_index -> vector of (rowid, should_add)
+        // should_add: true means add, false means remove
+        std::unordered_map<int, std::vector<std::pair<uint64_t, bool>>> bitmap_ops;
+        // Track rowids that need full initialization (no previous value)
+        std::vector<std::pair<uint64_t, int>> full_init_updates;
+        
+        // First pass: collect all operations, grouped by affected bitmaps
+        for (const auto &update : updates) {
+            uint64_t rowid = update.first;
+            int to_val = update.second;
+            
+            // Use lookup table to find current value
+            int from_val = -1;
+            auto it = rowid_to_value.find(rowid);
+            if (it != rowid_to_value.end()) {
+                from_val = it->second;
+            }
+            
+            if (from_val >= 0 && to_val >= 0) {
+                // Only update the range that changed
+                int minv = std::min(from_val, to_val);
+                int maxv = std::max(from_val, to_val);
+                for (int i = minv; i <= maxv; ++i) {
+                    bool should_add = (i >= to_val);
+                    bitmap_ops[i].push_back({rowid, should_add});
+                }
+            } else if (from_val < 0 && to_val >= 0) {
+                // No previous value, need full initialization
+                full_init_updates.push_back({rowid, to_val});
+            } else if (to_val < 0) {
+                // Clearing: remove from all bitmaps where it exists
+                if (from_val >= 0) {
+                    // Remove from all bitmaps from from_val to end
+                    for (int i = from_val; i < num_bitmaps; ++i) {
+                        bitmap_ops[i].push_back({rowid, false});
+                    }
+                }
+            }
+            
+            // Update mapping
+            if (to_val >= 0) {
+                rowid_to_value[rowid] = to_val;
+            } else {
+                rowid_to_value.erase(rowid);
+            }
+            
+            // Update number_of_rows
+            if (rowid >= number_of_rows) {
+                number_of_rows = rowid + 1;
+            }
+        }
+        
+        // Second pass: batch process operations grouped by bitmap (reduces array access)
+        for (const auto &entry : bitmap_ops) {
+            int bitmap_idx = entry.first;
+            const auto &ops = entry.second;
+            // Cache bitmap reference to avoid repeated array access
+            auto &bitmap = bitmaps[bitmap_idx];
+            
+            for (const auto &op : ops) {
+                uint64_t rowid = op.first;
+                bool should_add = op.second;
+                
+                if (should_add) {
+                    if (!bitmap.contains(rowid)) {
+                        bitmap.add(rowid);
+                    }
+                } else {
+                    if (bitmap.contains(rowid)) {
+                        bitmap.remove(rowid);
+                    }
+                }
+            }
+        }
+        
+        // Third pass: handle full initialization (rowids with no previous value)
+        for (const auto &update : full_init_updates) {
+            uint64_t rowid = update.first;
+            int to_val = update.second;
+            
+            // Set all bits according to to_val
+            for (int i = 0; i < num_bitmaps; ++i) {
+                auto &bitmap = bitmaps[i];
+                if (i < to_val) {
+                    if (bitmap.contains(rowid)) {
+                        bitmap.remove(rowid);
+                    }
+                } else {
+                    if (!bitmap.contains(rowid)) {
+                        bitmap.add(rowid);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void BitmapTable::EnsureBitmapForValue(int value) {
