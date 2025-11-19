@@ -20,10 +20,6 @@ mkdir -p "${RESULT_DIR}"
 OUT_WITH_EXT="${RESULT_DIR}/${DATESTAMP}-with-extension.txt"
 OUT_BASELINE="${RESULT_DIR}/${DATESTAMP}-baseline.txt"
 
-# aligned folders for per-query tests
-WITH_DIR="${RESULT_DIR}/${DATESTAMP}-per-query-with"
-BASE_DIR="${RESULT_DIR}/${DATESTAMP}-per-query-baseline"
-mkdir -p "$WITH_DIR" "$BASE_DIR"
 
 # Clean DuckDB logs (in case they exist)
 rm -f duckdb_logs.txt duckdb_tmp_* || true
@@ -43,25 +39,21 @@ if [ ! -f "${EXTENSION_PATH}" ]; then
     exit 1
 fi
 
-# -------------------------------------------------------
-# Per-query benchmarks (1–22)
-# Each executed separately with/without extension
-# -------------------------------------------------------
-echo "----------------------------------------------"
-echo " Per-query benchmark 1..22"
-echo "----------------------------------------------"
 
-#10 , 21
-for q in {1..22}; do
-    echo "Running Q${q} WITH extension..."
-    timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${WITH_DIR}/q${q}.out" 2>&1
+echo "----------------------------------------------"
+echo " Running TPC-H with Bitmap Index Extension"
+echo "----------------------------------------------"
+"${DUCKDB_BIN}" ":memory:" <<SQL | tee "${OUT_WITH_EXT}"
+-- Install & load required extensions
 INSTALL '${EXTENSION_PATH}';
 LOAD '${EXTENSION_NAME}';
+
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=0.01);
 
--- indexes (same as global run)
+-- Create bitmap indexes useful for TPC-H queries
+-- Only equality predicates, numeric + VARCHAR supported
 CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
 CREATE INDEX O_ORDERPRIORITY_idx ON ORDERS USING BITMAP (O_ORDERPRIORITY);
 CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP (O_ORDERSTATUS);
@@ -74,15 +66,25 @@ CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP (L_RETURNFLAG);
 
 PRAGMA threads=8;
 
-.timer on
-PRAGMA tpch(${q});
-EOF
+SELECT now(), '--- TPC-H with bitmap extension ---';
+-- EXPLAIN ANALYZE PRAGMA tpch(6);    -- example query
+PRAGMA tpch(2);
+SELECT now(), '--- TPC-H with bitmap extension ---';
+SQL
 
-    echo "Running Q${q} BASELINE()..."
-    timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${BASE_DIR}/q${q}.out" 2>&1
+
+echo "----------------------------------------------"
+echo " Running TPC-H Baseline (No Extension) , ART"
+echo "----------------------------------------------"
+"${DUCKDB_BIN}" ":memory:" <<SQL | tee "${OUT_BASELINE}"
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=0.01);
+
+PRAGMA threads=8;
+
+SELECT now(), '--- baseline ---';
+--EXPLAIN ANALYZE PRAGMA tpch(6);
 -- CUSTOMER table
 CREATE INDEX C_MKTSEGMENT_art_idx ON CUSTOMER (C_MKTSEGMENT);
 CREATE INDEX C_NATIONKEY_art_idx ON CUSTOMER (C_NATIONKEY);
@@ -103,12 +105,11 @@ CREATE INDEX PS_SUPPKEY_art_idx ON PARTSUPP (PS_SUPPKEY);
 -- LINEITEM table
 CREATE INDEX L_SUPPKEY_art_idx ON LINEITEM (L_SUPPKEY);
 CREATE INDEX L_RETURNFLAG_art_idx ON LINEITEM (L_RETURNFLAG);
-PRAGMA threads=8;
-.timer on
-PRAGMA tpch(${q});
-EOF
 
-done
+PRAGMA tpch(2);
+SELECT now(), '--- baseline ---';
+SQL
+
 
 echo ""
 echo "----------------------------------------------"
@@ -116,6 +117,5 @@ echo " Benchmark Finished!"
 echo " Output:"
 echo "  Global with extension: $OUT_WITH_EXT"
 echo "  Global baseline:        $OUT_BASELINE"
-echo "  Per-query with ext:     $WITH_DIR/"
-echo "  Per-query baseline:     $BASE_DIR/"
+
 echo "----------------------------------------------"
