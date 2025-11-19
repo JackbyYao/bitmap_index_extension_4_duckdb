@@ -90,6 +90,10 @@ public:
     // Accepts a vector of (rowid, value) pairs
     void SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> &updates);
 
+    // Merge another BitmapTable into this one (for parallel index construction)
+    // Merges bitmaps using union operation and combines rowid_to_value mappings
+    void MergeFrom(const BitmapTable &other);
+
     // In-memory bitmap storage. Each bitmap is a vector of 64-bit words.
     // use roaring map
     std::vector<roaring::Roaring> bitmaps;

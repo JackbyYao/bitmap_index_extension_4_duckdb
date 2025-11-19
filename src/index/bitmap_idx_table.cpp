@@ -1,10 +1,12 @@
 
 #include <fstream>
 #include <algorithm>
+#include <unordered_set>
 
 #include "bitmap_idx_table.hpp"
 
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/common/exception.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -337,13 +339,21 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
         // 1. Group removes by from_value to reduce array access
         // 2. Group adds by to_value to reduce array access
         // 3. Cache bitmap references to avoid repeated array indexing
+        // 4. Use reserve and emplace_back for memory efficiency
+        
+        // Estimate sizes to reduce reallocations
+        const size_t updates_size = updates.size();
+        const size_t estimated_values = std::min(static_cast<size_t>(num_bitmaps), updates_size / 4);
         
         // Map: from_value -> vector of rowids to remove
         std::unordered_map<int, std::vector<uint64_t>> removes_by_value;
+        removes_by_value.reserve(estimated_values);
         // Map: to_value -> vector of rowids to add
         std::unordered_map<int, std::vector<uint64_t>> adds_by_value;
-        // Track rowids to remove from mapping
-        std::vector<uint64_t> rowids_to_clear;
+        adds_by_value.reserve(estimated_values);
+        // Track rowids to remove from mapping (use set for faster lookup)
+        std::unordered_set<uint64_t> rowids_to_clear_set;
+        rowids_to_clear_set.reserve(updates_size);
         
         // First pass: collect all operations grouped by value
         for (const auto &update : updates) {
@@ -359,17 +369,17 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
             
             // Collect remove operation
             if (from_val >= 0 && from_val < num_bitmaps) {
-                removes_by_value[from_val].push_back(rowid);
-                rowids_to_clear.push_back(rowid);
+                removes_by_value[from_val].emplace_back(rowid);
+                rowids_to_clear_set.insert(rowid);
             }
             
             // Collect add operation
             if (to_val >= 0 && to_val < num_bitmaps) {
-                adds_by_value[to_val].push_back(rowid);
+                adds_by_value[to_val].emplace_back(rowid);
             } else {
                 // Negative value means clear
                 if (from_val >= 0) {
-                    rowids_to_clear.push_back(rowid);
+                    rowids_to_clear_set.insert(rowid);
                 }
             }
             
@@ -377,6 +387,14 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
             if (rowid >= number_of_rows) {
                 number_of_rows = rowid + 1;
             }
+        }
+        
+        // Reserve capacity for vectors to reduce reallocations
+        for (auto &entry : removes_by_value) {
+            entry.second.reserve(entry.second.size());
+        }
+        for (auto &entry : adds_by_value) {
+            entry.second.reserve(entry.second.size());
         }
         
         // Second pass: batch remove operations (grouped by bitmap to reduce array access)
@@ -402,12 +420,13 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
             }
         }
         
-        // Update mapping: remove cleared rowids
-        for (uint64_t rowid : rowids_to_clear) {
-            // Only remove if not being added (check adds_by_value)
+        // Update mapping: remove cleared rowids (only if not being added)
+        for (uint64_t rowid : rowids_to_clear_set) {
+            // Check if rowid is being added
             bool being_added = false;
             for (const auto &entry : adds_by_value) {
                 const auto &rowids = entry.second;
+                // Use binary search if sorted, or linear search
                 if (std::find(rowids.begin(), rowids.end(), rowid) != rowids.end()) {
                     being_added = true;
                     break;
@@ -424,12 +443,18 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
         // 2. Use lookup table to find current values (O(1) lookup)
         // 3. Only update the range that changed for each rowid
         // 4. Cache bitmap references to avoid repeated array indexing
+        // 5. Use reserve and emplace_back for memory efficiency
+        
+        const size_t updates_size = updates.size();
+        const size_t estimated_bitmaps = std::min(static_cast<size_t>(num_bitmaps), updates_size);
         
         // Map: bitmap_index -> vector of (rowid, should_add)
         // should_add: true means add, false means remove
         std::unordered_map<int, std::vector<std::pair<uint64_t, bool>>> bitmap_ops;
+        bitmap_ops.reserve(estimated_bitmaps);
         // Track rowids that need full initialization (no previous value)
         std::vector<std::pair<uint64_t, int>> full_init_updates;
+        full_init_updates.reserve(updates_size / 2);  // Estimate: half might need full init
         
         // First pass: collect all operations, grouped by affected bitmaps
         for (const auto &update : updates) {
@@ -449,17 +474,17 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
                 int maxv = std::max(from_val, to_val);
                 for (int i = minv; i <= maxv; ++i) {
                     bool should_add = (i >= to_val);
-                    bitmap_ops[i].push_back({rowid, should_add});
+                    bitmap_ops[i].emplace_back(rowid, should_add);
                 }
             } else if (from_val < 0 && to_val >= 0) {
                 // No previous value, need full initialization
-                full_init_updates.push_back({rowid, to_val});
+                full_init_updates.emplace_back(rowid, to_val);
             } else if (to_val < 0) {
                 // Clearing: remove from all bitmaps where it exists
                 if (from_val >= 0) {
                     // Remove from all bitmaps from from_val to end
                     for (int i = from_val; i < num_bitmaps; ++i) {
-                        bitmap_ops[i].push_back({rowid, false});
+                        bitmap_ops[i].emplace_back(rowid, false);
                     }
                 }
             }
@@ -475,6 +500,11 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
             if (rowid >= number_of_rows) {
                 number_of_rows = rowid + 1;
             }
+        }
+        
+        // Reserve capacity for vectors to reduce reallocations
+        for (auto &entry : bitmap_ops) {
+            entry.second.reserve(entry.second.size());
         }
         
         // Second pass: batch process operations grouped by bitmap (reduces array access)
@@ -520,6 +550,45 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
             }
         }
     }
+}
+
+void BitmapTable::MergeFrom(const BitmapTable &other) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!config || !other.config) return;
+
+    // Ensure both have the same encoding
+    if (config->encoding != other.config->encoding) {
+        throw InternalException("Bitmap index encoding mismatch during merge");
+    }
+
+    // Ensure this table has enough bitmaps
+    int max_bitmaps = std::max(num_bitmaps, other.num_bitmaps);
+    if (max_bitmaps > num_bitmaps) {
+        num_bitmaps = max_bitmaps;
+        bitmaps.resize(max_bitmaps);
+    }
+
+    // Merge bitmaps: for each value, union the other bitmap into this bitmap
+    for (int i = 0; i < other.num_bitmaps; ++i) {
+        if (i < num_bitmaps) {
+            // Union operation: this_bitmap |= other_bitmap
+            bitmaps[i] |= other.bitmaps[i];
+        } else {
+            // Other has more bitmaps, copy them
+            bitmaps.push_back(other.bitmaps[i]);
+        }
+    }
+
+    // Merge rowid_to_value mappings
+    // For conflicts (same rowid in both), use the other's value (other is more recent)
+    for (const auto &entry : other.rowid_to_value) {
+        uint64_t rowid = entry.first;
+        int value = entry.second;
+        rowid_to_value[rowid] = value;
+    }
+
+    // Update number_of_rows to maximum
+    number_of_rows = std::max(number_of_rows, other.number_of_rows);
 }
 
 void BitmapTable::EnsureBitmapForValue(int value) {
