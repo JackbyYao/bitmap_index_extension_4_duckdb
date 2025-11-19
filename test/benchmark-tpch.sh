@@ -1,93 +1,121 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------
-# Configuration
-# -----------------------------
+###############################################################################
+# Setup
+###############################################################################
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 REPO_NAME=$(basename "${SCRIPT_DIR%/*}")
 DUCKDB_BIN="../${REPO_NAME}/build/release/duckdb"
-EXTENSION_NAME="bitmap_index"
-RESULT_DIR="./benchmark-results"
-DATESTAMP=$(date +"%Y%m%d-%H%M%S")
-
-mkdir -p "${RESULT_DIR}"
-
-OUT_WITH_EXT="${RESULT_DIR}/benchmark-tpch-${EXTENSION_NAME}-${DATESTAMP}.out.txt"
-OUT_BASELINE="${RESULT_DIR}/benchmark-tpch-baseline-${DATESTAMP}.out.txt"
-
 EXTENSION_PATH="../${REPO_NAME}/build/release/extension/bitmap_idx/bitmap_idx.duckdb_extension"
 
-# -----------------------------
-# Check that DuckDB exists
-# -----------------------------
+TS=$(date +"%Y%m%d-%H%M%S")
+RESULT_ROOT="benchmark-results/${TS}"
+mkdir -p "${RESULT_ROOT}"
+
+# basedir for per-query results
+WITH_DIR="${RESULT_ROOT}/with"
+BASE_DIR="${RESULT_ROOT}/baseline"
+mkdir -p "${WITH_DIR}" "${BASE_DIR}"
+
+###############################################################################
+# Ensure DuckDB exists
+###############################################################################
 if [ ! -x "${DUCKDB_BIN}" ]; then
     echo "Error: DuckDB binary not found at ${DUCKDB_BIN}"
-    echo "Please build DuckDB first (e.g., 'make release')."
     exit 1
 fi
 
-# -----------------------------
-# Run TPC-H with the extension
-# -----------------------------
-echo "Running TPC-H with extension '${EXTENSION_NAME}'..."
-"${DUCKDB_BIN}" -unsigned <<SQL | tee "${OUT_WITH_EXT}"
--- 1. Load the custom extension (Using .load for custom extensions)
+###############################################################################
+# Function to run a single TPC-H query (1–22)
+###############################################################################
+run_query_with_extension() {
+    local q=$1
+    local out_file="${WITH_DIR}/q$(printf "%02d" ${q})-with.out"
+    local time_file="${WITH_DIR}/q$(printf "%02d" ${q})-with.time"
+
+    "${DUCKDB_BIN}" -unsigned <<SQL > "${out_file}" 2> /dev/null
+.timer on
 LOAD '${EXTENSION_PATH}';
-
--- 2. Install and load the TPC-H extension (fixes 'dbgen' and 'tpch_scale_factor' errors)
 INSTALL tpch;
 LOAD tpch;
+CALL dbgen(sf=0.001);
 
--- 3. Generate data (assuming a new in-memory database instance)
-CALL dbgen(sf=0.01);
---PRAGMA tpch_scale_factor=1;
-
+-- Create bitmap indexes
 CREATE INDEX L_SUPPKEY_idx ON LINEITEM USING BITMAP(L_SUPPKEY);
+CREATE INDEX L_RETURNFLAG_idx ON LINEITEM USING BITMAP(L_RETURNFLAG);
+CREATE INDEX L_LINESTATUS_idx ON LINEITEM USING BITMAP(L_LINESTATUS);
+CREATE INDEX O_ORDERSTATUS_idx ON ORDERS USING BITMAP(O_ORDERSTATUS);
+CREATE INDEX PS_SUPPKEY_idx ON PARTSUPP USING BITMAP(PS_SUPPKEY);
+CREATE INDEX P_TYPE_idx ON PART USING BITMAP(P_TYPE);
+CREATE INDEX P_SIZE_idx ON PART USING BITMAP(P_SIZE);
+CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP(C_MKTSEGMENT);
 
--- 4. Set configuration
-PRAGMA threads=4;
-
--- 5. Run benchmark
-
--- NOTE: Ensure your DuckDB build includes the 'benchmark' extension if needed,
--- or replace with the actual TPC-H queries if 'benchmark' is not a valid function.
-SELECT now(), '--- TPC-H with ${EXTENSION_NAME} ---';
-PRAGMA tpch(6);
-SELECT now(), '--- TPC-H with ${EXTENSION_NAME} ---';
-
--- 6. report the state of index:
--- SELECT * FROM bitmap_index_dump(L_SUPPKEY_idx);
+-- Run query
+PRAGMA tpch($q);
+.timer off
 SQL
 
-# -----------------------------
-# Run baseline (no extension)
-# -----------------------------
-echo "Running TPC-H baseline (no extension)..."
-"${DUCKDB_BIN}" -unsigned <<SQL | tee "${OUT_BASELINE}"
--- 1. Install and load the TPC-H extension (MANDATORY for baseline run too!)
+    # Extract timing from output
+    grep "Run Time" -m1 "${out_file}" | sed 's/^/TIME: /' > "${time_file}"
+}
+
+run_query_without_extension() {
+    local q=$1
+    local out_file="${BASE_DIR}/q$(printf "%02d" ${q})-base.out"
+    local time_file="${BASE_DIR}/q$(printf "%02d" ${q})-base.time"
+
+    "${DUCKDB_BIN}" -unsigned <<SQL > "${out_file}" 2> /dev/null
+.timer on
 INSTALL tpch;
 LOAD tpch;
+CALL dbgen(sf=0.001);
 
--- 2. Generate data
-CALL dbgen(sf=0.01);
---PRAGMA tpch_scale_factor=1;
-
--- 3. Set configuration
-
-PRAGMA threads=4;
-
--- 4. Run benchmark (using now() instead of current_timestamp())
-SELECT now(), '--- TPC-H baseline ---';
-
--- NOTE: As above, verify 'benchmark' function availability.
-PRAGMA tpch(6);
-SELECT now(), '--- TPC-H baseline ---';
+PRAGMA tpch($q);
+.timer off
 SQL
 
-# -----------------------------
-# Done
-# -----------------------------
-echo "Benchmark complete!"
-echo "With extension: ${OUT_WITH_EXT}"
-echo "Baseline:       ${OUT_BASELINE}"
+    grep "Run Time" -m1 "${out_file}" | sed 's/^/TIME: /' > "${time_file}"
+}
+
+###############################################################################
+# Main loop
+###############################################################################
+echo "Running per-query benchmark WITH extension..."
+for q in $(seq 1 22); do
+    echo "Running query $q (with extension)..."
+    run_query_with_extension $q
+done
+
+echo "Running per-query benchmark WITHOUT extension..."
+for q in $(seq 1 22); do
+    echo "Running query $q (baseline)..."
+    run_query_without_extension $q
+done
+
+###############################################################################
+# Compare outputs
+###############################################################################
+echo "Comparing outputs..."
+
+for q in $(seq 1 22); do
+    w="${WITH_DIR}/q$(printf "%02d" ${q})-with.out"
+    b="${BASE_DIR}/q$(printf "%02d" ${q})-base.out"
+
+    diff_out="${RESULT_ROOT}/q$(printf "%02d" ${q})-diff.txt"
+
+    if diff -q <(grep -v "Run Time" "$w") <(grep -v "Run Time" "$b") > /dev/null; then
+        echo "Q$q: OK" > "${diff_out}"
+    else
+        echo "Q$q: MISMATCH" > "${diff_out}"
+        diff <(grep -v "Run Time" "$w") <(grep -v "Run Time" "$b") >> "${diff_out}"
+    fi
+done
+
+###############################################################################
+# Cleanup: remove timing strings from output logs
+###############################################################################
+find "${RESULT_ROOT}" -type f -name "*.out" -exec sed -i '/Run Time/d' {} \;
+
+echo "Done."
+echo "Results stored in: ${RESULT_ROOT}"

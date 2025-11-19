@@ -10,6 +10,12 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 
+//Note: added for VARCHAR support
+#include <unordered_map>
+#include <mutex>
+#include <vector>
+#include <string>
+
 namespace duckdb {
 
 struct BitmapConfig {
@@ -29,6 +35,27 @@ public:
 	BitmapConfig bitmap_config;
 	Table_config table_config;
 	unique_ptr<BitmapTable> bitmap_table;
+
+//---------- This section is added for VARCHAR support
+	// Dictionary encoding for VARCHAR support: maps string values to small int ids
+	std::unordered_map<std::string, int> value_to_id;
+	std::vector<std::string> id_to_value;
+	mutable std::mutex dict_lock;
+
+	// Dictionary helper APIs
+	// Get existing id for `val` or create a new one.
+	int GetOrAddValueId(const std::string &val);
+	// Lookup id for `val`; returns -1 if not found.
+	int LookupValueId(const std::string &val) const;
+	// Lookup string value for `id`; returns numeric fallback if missing.
+	std::string LookupValueString(int id) const;
+
+	unique_ptr<IndexScanState> InitializeScan(const Value *filter_value) const;
+
+	// Whether this index currently has a populated dictionary (used for VARCHAR)
+	bool UsesDictionary() const;
+//---------
+
 
 	unique_ptr<IndexScanState> InitializeScan() const;
 	idx_t Scan(IndexScanState &state, Vector &result) const;

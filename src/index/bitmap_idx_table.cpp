@@ -343,3 +343,15 @@ std::vector<std::string> BitmapTable::GetDistinctValues() const {
     }
     return result;
 }
+
+void BitmapTable::GetRowsForValue(int value, std::vector<row_t> &out) const {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (value < 0 || value >= num_bitmaps) return;
+    // get values
+    const auto &bitmap = bitmaps[value];
+    out.clear();
+    out.reserve(bitmap.cardinality());
+    for (auto it = bitmap.begin(); it != bitmap.end(); ++it) {
+        out.push_back(static_cast<row_t>(*it));
+    }
+}

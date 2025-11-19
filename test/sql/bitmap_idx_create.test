@@ -22,10 +22,10 @@ INSERT INTO test_table VALUES
     (5, 'active', 9);
 
 # 测试3: 不支持字符串索引
-statement error
-CREATE INDEX idx_status ON test_table USING BITMAP(status);
-----
-Not implemented Error: Bitmap index currently supports only integer-like types
+#statement error
+#CREATE INDEX idx_status ON test_table USING BITMAP(status);
+#----
+#Not implemented Error: Bitmap index currently supports only integer-like types
 
 
 # 测试5: 创建INTEGER索引
@@ -67,3 +67,21 @@ SELECT COUNT(*) FROM pragma_bitmap_index_info();
 # 测试13: 清理
 statement ok
 DROP TABLE test_table;
+
+# 测试14: 
+statement ok
+CREATE TABLE t(a VARCHAR);
+
+# 测试15:
+statement ok
+INSERT INTO t VALUES ('apple'), ('banana'), ('apple'), ('cherry'), ('banana'), (NULL);
+
+# 测试16:
+statement ok
+CREATE INDEX idx_bitmap ON t USING BITMAP(a);
+
+# 测试17:
+query I
+SELECT COUNT(*) FROM t WHERE a = 'apple';
+----
+2

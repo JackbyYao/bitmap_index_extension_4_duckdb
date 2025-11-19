@@ -138,13 +138,13 @@ public:
 				idx_t phys_col = entry.first;
 				const auto &column_ids = get.GetColumnIds();
 
-    			idx_t proj_idx = DConstants::INVALID_INDEX;
-    			for (idx_t i = 0; i < column_ids.size(); i++) {
-        			if (column_ids[i].GetPrimaryIndex() == phys_col) {
-            			proj_idx = i;
-            			break;
-        			}
-    			}
+				idx_t proj_idx = DConstants::INVALID_INDEX;
+				for (idx_t i = 0; i < column_ids.size(); i++) {
+					if (column_ids[i].GetPrimaryIndex() == phys_col) {
+						proj_idx = i;
+						break;
+					}
+				}
 				if (proj_idx == DConstants::INVALID_INDEX) {
 					// column not present in this LogicalGet's projection -> skip
 					continue;
@@ -152,10 +152,21 @@ public:
 				unique_ptr<Expression> table_expr;
 
 				//auto &expr_filter = entry.second->Cast<ConstantFilter>();
-				auto &type = get.returned_types[entry.first]; // returned_types indexed by physical col id
-        		auto bound_colref = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, proj_idx));
-        		// synthesize an expression from the TableFilter
-       		 	table_expr = entry.second->ToExpression(*bound_colref);
+
+				// obtain the DuckTableEntry from the LogicalGet before using it
+				auto &table_ref = *get.GetTable();
+				if (!table_ref.IsDuckTable()) {
+					// not a DuckTable, skip this filter
+					continue;
+				}
+				auto &duck_table = table_ref.Cast<DuckTableEntry>();
+
+				// Use the table column type directly (safer than indexing get.returned_types)
+				auto &type = duck_table.GetColumns().GetColumn(LogicalIndex(phys_col)).Type();
+				// Debug logging removed: synthesized bound column reference information.
+				auto bound_colref = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, proj_idx));
+				// synthesize an expression from the TableFilter
+				table_expr = entry.second->ToExpression(*bound_colref);
 
 				if (!table_expr) {
 					// couldn't synthesize a bound expression -> skip
@@ -293,31 +304,70 @@ public:
 				id = get.projection_ids[id];
 			}
 		}
-		get.projection_ids.clear();
-		get.types.clear();
 
 		// Create a new LogicalFilter above the get that contains the old table filters rewritten against the index projection
 		auto new_filter = make_uniq<LogicalFilter>();
 		auto &column_ids = get.GetColumnIds();
 		for (const auto &entry : get.table_filters.filters) {
-			idx_t column_id = entry.first;
-			auto &type = get.returned_types[column_id];
-			bool found = false;
+			idx_t phys_column_id = entry.first;
+			// find the local projection index for this physical column
+			idx_t local_idx = DConstants::INVALID_INDEX;
 			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == column_id) {
-					column_id = i;
-					found = true;
+				if (column_ids[i].GetPrimaryIndex() == phys_column_id) {
+					local_idx = i;
 					break;
 				}
 			}
-			if (!found) {
+			if (local_idx == DConstants::INVALID_INDEX) {
 				throw InternalException("Could not find column id for filter");
 			}
-			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, column_id));
+			// get type from the table schema (robust to projection/order differences)
+			auto &type = duck_table.GetColumns().GetColumn(LogicalIndex(phys_column_id)).Type();
+			// Determine the correct local binding index visible to the LogicalGet's projection
+			idx_t bound_idx = local_idx;
+			if (!get.projection_ids.empty()) {
+				// projection_ids maps output positions -> column index; find the output position
+				// that corresponds to our local_idx (if any)
+				idx_t found = DConstants::INVALID_INDEX;
+				for (idx_t pj = 0; pj < get.projection_ids.size(); pj++) {
+					if (get.projection_ids[pj] == local_idx) {
+						found = pj;
+						break;
+					}
+				}
+				if (found != DConstants::INVALID_INDEX) {
+					bound_idx = found;
+				} else {
+					// Try a secondary mapping: projection_ids may reference indices into column_ids;
+					// check whether any projection position maps (via column_ids) to the physical column id.
+					idx_t fallback = DConstants::INVALID_INDEX;
+					for (idx_t pj = 0; pj < get.projection_ids.size(); ++pj) {
+						idx_t proj_val = get.projection_ids[pj];
+						if (proj_val != DConstants::INVALID_INDEX && proj_val < column_ids.size()) {
+							if (column_ids[proj_val].GetPrimaryIndex() == phys_column_id) {
+								fallback = pj;
+								break;
+							}
+						}
+					}
+					if (fallback != DConstants::INVALID_INDEX) {
+						bound_idx = fallback;
+					} else {
+						// Conservative: cannot map into projection ids; skip optimization for this Get.
+						return false;
+					}
+				}
+			}
+			auto column = make_uniq<BoundColumnRefExpression>(type, ColumnBinding(get.table_index, bound_idx));
 			new_filter->expressions.push_back(entry.second->ToExpression(*column));
 		}
 		new_filter->children.push_back(std::move(get_ptr));
+		// Resolve types and bindings; let exceptions propagate for the caller to handle.
 		new_filter->ResolveOperatorTypes();
+
+		// Now that types/bindings are resolved, we can safely clear the projection ids on the get
+		get.projection_ids.clear();
+
 		get_ptr = std::move(new_filter);
 		return true;
 	}

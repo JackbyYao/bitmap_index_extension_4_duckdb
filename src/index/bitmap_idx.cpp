@@ -73,6 +73,37 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 	}
 }
 
+// VARCHAR support
+int BitmapIndex::GetOrAddValueId(const string &val) {
+	std::lock_guard<std::mutex> guard(dict_lock);
+	auto it = value_to_id.find(val);
+	if (it != value_to_id.end()) return it->second;
+	int id = static_cast<int>(id_to_value.size());
+	id_to_value.push_back(val);
+	value_to_id[val] = id;
+	return id;
+}
+
+int BitmapIndex::LookupValueId(const string &val) const {
+	std::lock_guard<std::mutex> guard(dict_lock);
+	auto it = value_to_id.find(val);
+	if (it == value_to_id.end()) return -1;
+	return it->second;
+}
+
+string BitmapIndex::LookupValueString(int id) const {
+	std::lock_guard<std::mutex> guard(dict_lock);
+	if (id < 0 || id >= static_cast<int>(id_to_value.size())) {
+		return std::to_string(id);
+	}
+	return id_to_value[id];
+}
+
+bool BitmapIndex::UsesDictionary() const {
+	std::lock_guard<std::mutex> guard(dict_lock);
+	return !id_to_value.empty();
+}
+
 unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
 	if (!bitmap_table) {
 		return nullptr;
@@ -84,6 +115,76 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
 		return true;
 	});
 	return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+}
+
+unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value) const{
+	// If no bitmap table present, nothing to do
+    if (!bitmap_table) {
+        return nullptr;
+    }
+
+	std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
+
+	// No filter or NULL filter -> default full-scan
+		if (!filter_value || filter_value->IsNull()) {
+			return InitializeScan(); // calls existing full-scan implementation
+		}
+
+    try {
+		// Optimize for VARCHAR and integer-like types
+		auto type_id = filter_value->type().id();
+		if (type_id == LogicalTypeId::VARCHAR) {
+			// If index hasn't used the dictionary, fall back to full-scan
+			if (!UsesDictionary()) {
+				return InitializeScan();
+			}
+			// Resolve string -> id
+			const string sval = filter_value->ToString();
+			int id = LookupValueId(sval);
+			vector<row_t> matches;
+			if (id >= 0 && bitmap_table) {
+				bitmap_table->GetRowsForValue(id, matches);
+			}
+			// Return a scan state backed by the bitmap_table and the explicit matches
+			return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+		} else if (type_id == LogicalTypeId::BOOLEAN || type_id == LogicalTypeId::TINYINT ||
+				   type_id == LogicalTypeId::UTINYINT || type_id == LogicalTypeId::SMALLINT ||
+				   type_id == LogicalTypeId::USMALLINT || type_id == LogicalTypeId::INTEGER ||
+				   type_id == LogicalTypeId::UINTEGER || type_id == LogicalTypeId::BIGINT ||
+				   type_id == LogicalTypeId::UBIGINT) {
+			// Handle integer-like filters by extracting numeric value and performing a lookup
+			vector<row_t> matches;
+			if (!bitmap_table) {
+				return nullptr;
+			}
+			// Unsigned types: retrieve as uint64_t to check bounds
+			if (type_id == LogicalTypeId::UTINYINT || type_id == LogicalTypeId::USMALLINT ||
+				type_id == LogicalTypeId::UINTEGER || type_id == LogicalTypeId::UBIGINT) {
+				uint64_t uv = filter_value->GetValue<uint64_t>();
+				if (uv > static_cast<uint64_t>(NumericLimits<int32_t>::Maximum())) {
+					// out of bounds -> no matches (or fallback to full scan)
+					return InitializeScan();
+				}
+				int32_t key = static_cast<int32_t>(uv);
+				bitmap_table->GetRowsForValue(key, matches);
+				return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+			} else {
+				// Signed numeric types and boolean
+				int64_t sv = filter_value->GetValue<int64_t>();
+				if (sv < NumericLimits<int32_t>::Minimum() || sv > NumericLimits<int32_t>::Maximum()) {
+					return InitializeScan();
+				}
+				int32_t key = static_cast<int32_t>(sv);
+				bitmap_table->GetRowsForValue(key, matches);
+				return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+			}
+		} else {
+			// For other filter types, fall back to full-scan for now
+			return InitializeScan();
+		}
+	} catch (...) {
+		return InitializeScan();
+	}
 }
 
 idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {
@@ -167,6 +268,15 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		case LogicalTypeId::UBIGINT:
 			value = static_cast<int64_t>(reinterpret_cast<uint64_t *>(value_data.data)[physical_index]);
 			break;
+		case LogicalTypeId::VARCHAR: {
+			// VARCHAR support, For better performance, extract the underlying string_t from the
+			// UnifiedVectorFormat data pointer. (since currenly we're creating key string on the fly)
+			Value v = value_vector.GetValue(physical_index);
+			string s = v.ToString();
+			int id = GetOrAddValueId(s);
+			value = id;
+			break;
+		}
 		default:
 			throw NotImplementedException("Bitmap index currently supports only integer-like types");
 		}
@@ -270,7 +380,28 @@ std::vector<std::string> BitmapIndex::GetDistinctValues() const {
 	if (!bitmap_table) {
 		return {};
 	}
-	return bitmap_table->GetDistinctValues();
+	// If we haven't populated a dictionary (no VARCHAR support used), just
+	// return the bitmap table's existing distinct-values (original behavior).
+	{
+		std::lock_guard<std::mutex> guard(dict_lock);
+		if (id_to_value.empty()) {
+			return bitmap_table->GetDistinctValues();
+		}
+	}
+	// Otherwise, convert numeric ids (as returned by BitmapTable) to human-readable strings
+	auto numeric_vals = bitmap_table->GetDistinctValues();
+	std::vector<std::string> result;
+	result.reserve(numeric_vals.size());
+	for (auto &s : numeric_vals) {
+		try {
+			int id = std::stoi(s);
+			result.push_back(LookupValueString(id));
+		} catch (...) {
+			// If parsing fails, just forward the raw string
+			result.push_back(s);
+		}
+	}
+	return result;
 }
 
 
