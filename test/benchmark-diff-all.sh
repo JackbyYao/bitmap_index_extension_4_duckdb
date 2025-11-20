@@ -21,15 +21,17 @@ fi
 echo "Using benchmark dir: $BENCH_DIR"
 
 
-declare -A timestamps=()
+declare -A runs=()
 
-# Find candidate timestamps from global files like: 20251119-025917-with-extension.txt
+# Find candidate timestamps from global files like: 20251119-025917-branch-with-extension.txt
 for f in "$BENCH_DIR"/*-with-extension.txt; do
     [ -e "$f" ] || continue
     bn=$(basename "$f")
-    if [[ $bn =~ ^([0-9]{8}-[0-9]{6})-with-extension\.txt$ ]]; then
+    if [[ $bn =~ ^([0-9]{8}-[0-9]{6})-([A-Za-z0-9._-]+)-with-extension\.txt$ ]]; then
         ts=${BASH_REMATCH[1]}
-        timestamps["$ts"]=1
+        branch=${BASH_REMATCH[2]}
+        key="${ts}|${branch}"
+        runs["$key"]=1
     fi
 done
 
@@ -37,13 +39,15 @@ done
 for d in "$BENCH_DIR"/*-per-query-with; do
     [ -e "$d" ] || continue
     bn=$(basename "$d")
-    if [[ $bn =~ ^([0-9]{8}-[0-9]{6})-per-query-with$ ]]; then
+    if [[ $bn =~ ^([0-9]{8}-[0-9]{6})-([A-Za-z0-9._-]+)-per-query-with$ ]]; then
         ts=${BASH_REMATCH[1]}
-        timestamps["$ts"]=1
+        branch=${BASH_REMATCH[2]}
+        key="${ts}|${branch}"
+        runs["$key"]=1
     fi
 done
 
-if [ ${#timestamps[@]} -eq 0 ]; then
+if [ ${#runs[@]} -eq 0 ]; then
     echo "No '-with-extension.txt' files or '*-per-query-with' directories found in $BENCH_DIR"
     exit 0
 fi
@@ -52,11 +56,13 @@ found_pairs=0
 total_diffs=0
 nonempty_diffs=0
 
-for ts in "${!timestamps[@]}"; do
-    base_file="$BENCH_DIR/${ts}-baseline.txt"
-    with_file="$BENCH_DIR/${ts}-with-extension.txt"
-    with_dir="$BENCH_DIR/${ts}-per-query-with"
-    base_dir="$BENCH_DIR/${ts}-per-query-baseline"
+for key in "${!runs[@]}"; do
+    ts="${key%%|*}"
+    branch="${key##*|}"
+    base_file="$BENCH_DIR/${ts}-${branch}-baseline.txt"
+    with_file="$BENCH_DIR/${ts}-${branch}-with-extension.txt"
+    with_dir="$BENCH_DIR/${ts}-${branch}-per-query-with"
+    base_dir="$BENCH_DIR/${ts}-${branch}-per-query-baseline"
 
     has_global=false
     has_perquery=false
@@ -78,7 +84,7 @@ for ts in "${!timestamps[@]}"; do
 
     # Print a header for this timestamp
     echo
-    echo "==================== Timestamp: $ts ===================="
+    echo "==================== Timestamp: $ts  (branch: $branch) ===================="
 
     # Global diff (only if both files exist). Exclude last line from comparison.
     if [ "$has_global" = true ]; then
