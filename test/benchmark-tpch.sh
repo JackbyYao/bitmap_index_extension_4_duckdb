@@ -59,7 +59,7 @@ INSTALL '${EXTENSION_PATH}';
 LOAD '${EXTENSION_NAME}';
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=1);
+CALL dbgen(sf=0.01);
 
 -- indexes (same as global run)
 CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
@@ -82,7 +82,7 @@ EOF
     timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${BASE_DIR}/q${q}.out" 2>&1
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=1);
+CALL dbgen(sf=0.01);
 -- CUSTOMER table
 CREATE INDEX C_MKTSEGMENT_art_idx ON CUSTOMER (C_MKTSEGMENT);
 CREATE INDEX C_NATIONKEY_art_idx ON CUSTOMER (C_NATIONKEY);

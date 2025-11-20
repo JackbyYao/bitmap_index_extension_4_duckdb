@@ -44,6 +44,7 @@ PhysicalCreateBitmapIndex::PhysicalCreateBitmapIndex(PhysicalPlan &physical_plan
 class CreateBitmapIndexLocalSinkState final : public LocalSinkState {
 public:
 	unique_ptr<BitmapIndex> local_index;
+	idx_t local_entries = 0;
 };
 
 //-------------------------------------------------------------
@@ -56,6 +57,7 @@ public:
 	AllocatedData slice_buffer;
 
 	idx_t entry_idx;
+	mutex merge_lock;
 };
 
 unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(ClientContext &context) const {
@@ -98,6 +100,38 @@ static unique_ptr<BitmapIndex> CreateLocalBitmapIndex(const PhysicalCreateBitmap
 	                              IndexStorageInfo(), op.estimated_cardinality, global_index.GetDictionary());
 }
 
+static void FlushLocalIndex(CreateBitmapIndexGlobalState &gstate, CreateBitmapIndexLocalSinkState &lstate,
+                            const PhysicalCreateBitmapIndex &op, bool reinitialize) {
+	if (!lstate.local_index) {
+		return;
+	}
+	auto &local_bitmap_table = lstate.local_index->bitmap_table;
+	if (!local_bitmap_table || local_bitmap_table->GetNumberOfRows() == 0) {
+		if (!reinitialize) {
+			lstate.local_index.reset();
+		}
+		lstate.local_entries = 0;
+		return;
+	}
+
+	{
+		lock_guard<mutex> guard(gstate.merge_lock);
+		auto &global_bitmap_table = gstate.bitmap_ptr->bitmap_table;
+		if (global_bitmap_table) {
+			global_bitmap_table->MergeFrom(*local_bitmap_table);
+		}
+	}
+
+	lstate.local_entries = 0;
+	if (reinitialize) {
+		lstate.local_index = CreateLocalBitmapIndex(op, *gstate.bitmap_ptr);
+	} else {
+		lstate.local_index.reset();
+	}
+}
+
+static constexpr idx_t LOCAL_FLUSH_THRESHOLD = STANDARD_VECTOR_SIZE * 32;
+
 //-------------------------------------------------------------
 // Sink
 //-------------------------------------------------------------
@@ -138,30 +172,23 @@ SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataCh
 	IndexLock lock;
 	bitmap_index.InitializeLock(lock);
 	bitmap_index.Append(lock, key_chunk, rowid_vector);
+	lstate.local_entries += chunk.size();
+
+	if (lstate.local_entries >= LOCAL_FLUSH_THRESHOLD) {
+		FlushLocalIndex(gstate, lstate, *this, true);
+	}
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
-//-------------------------------------------------------------
+//-------------------------------------------------------------·
 // Combine (merge local indexes into global index)
 //-------------------------------------------------------------
 SinkCombineResultType PhysicalCreateBitmapIndex::Combine(ExecutionContext &context,
                                                          OperatorSinkCombineInput &input) const {
 	auto &g_state = input.global_state.Cast<CreateBitmapIndexGlobalState>();
 	auto &l_state = input.local_state.Cast<CreateBitmapIndexLocalSinkState>();
-
-	if (!l_state.local_index) {
-		return SinkCombineResultType::FINISHED;
-	}
-
-	auto &global_bitmap_table = g_state.bitmap_ptr->bitmap_table;
-	auto &local_bitmap_table = l_state.local_index->bitmap_table;
-
-	if (!global_bitmap_table || !local_bitmap_table) {
-		return SinkCombineResultType::FINISHED;
-	}
-
-	global_bitmap_table->MergeFrom(*local_bitmap_table);
+	FlushLocalIndex(g_state, l_state, *this, false);
 	return SinkCombineResultType::FINISHED;
 }
 
