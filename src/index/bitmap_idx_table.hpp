@@ -6,6 +6,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <shared_mutex>
 #include <roaring/roaring.hh>
 
 #include "duckdb/common/common.hpp"
@@ -116,7 +117,7 @@ public:
 
     template <class FUN>
     void ForEachValue(FUN &&fun) const {
-        std::lock_guard<std::mutex> guard(g_lock);
+        std::shared_lock<std::shared_mutex> guard(g_lock);
         for (int value = 0; value < num_bitmaps; value++) {
             const auto &bitmap = bitmaps[value];
             // Use roaring iterator
@@ -131,7 +132,7 @@ public:
 
 protected:
     // Global read-write lock to protect the whole bitmap index.
-    mutable std::mutex g_lock;
+    mutable std::shared_mutex g_lock;
 
     void EnsureBitmapForValue(int value);
     void _get_value(uint64_t rowid, int begin, int range, bool *flag, int *result);

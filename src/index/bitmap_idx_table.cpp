@@ -59,7 +59,7 @@ BitmapTable::BitmapTable(Table_config *config) : BaseTable(config), number_of_ro
 
 int BitmapTable::append(int /*tid*/, int val)
 {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
 
     if (!config) return -1;
 
@@ -98,7 +98,7 @@ int BitmapTable::append(int /*tid*/, int val)
 
 int BitmapTable::update(int /*tid*/, uint64_t rowid, int to_val)
 {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
     if (!config) return -1;
     int from_val = get_value(rowid);
     if ((from_val == to_val) || (from_val == -1)) return -ENOENT;
@@ -144,7 +144,7 @@ int BitmapTable::evaluate(int /*tid*/, uint32_t val)
 {
     roaring::Roaring tmp;
     {
-        std::lock_guard<std::mutex> guard(g_lock);
+        std::shared_lock<std::shared_mutex> guard(g_lock);
         if (val >= (uint32_t)num_bitmaps) return 0;
         tmp = bitmaps[val];
     }
@@ -218,7 +218,7 @@ int BitmapTable::get_value(uint64_t rowid)
 void BitmapTable::printMemory()
 {
     uint64_t bytes = 0;
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     for (int i = 0; i < num_bitmaps; ++i) {
         bytes += bitmaps[i].getSizeInBytes();
     }
@@ -229,7 +229,7 @@ void BitmapTable::printUncompMemory()
 {
     // For roaring map, uncompressed size would be max 'row * 8 bytes'
     uint64_t bytes = 0;
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     for (int i = 0; i < num_bitmaps; i++) {
         uint64_t max_row = bitmaps[i].maximum();
         if (max_row != 0) {
@@ -240,7 +240,7 @@ void BitmapTable::printUncompMemory()
 }
 
 void BitmapTable::SetRowValue(uint64_t rowid, int to_val) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
     if (!config) return;
     if (config->encoding == Table_config::EE) {
         if (to_val >= 0) {
@@ -320,7 +320,7 @@ void BitmapTable::SetRowValue(uint64_t rowid, int to_val) {
 }
 
 void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> &updates) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
     if (!config || updates.empty()) return;
 
     // Ensure all required bitmaps exist
@@ -553,7 +553,7 @@ void BitmapTable::SetRowValuesBatch(const std::vector<std::pair<uint64_t, int>> 
 }
 
 void BitmapTable::MergeFrom(const BitmapTable &other) {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
     if (!config || !other.config) return;
 
     // Ensure both have the same encoding
@@ -614,14 +614,14 @@ void BitmapTable::ClearRow(uint64_t rowid) {
         // Disk-backed behaviour not implemented.
         return;
     }
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::unique_lock<std::shared_mutex> guard(g_lock);
     for (int i = 0; i < num_bitmaps; ++i) {
         bitmaps[i].remove(rowid);
     }
 }
 
 uint64_t BitmapTable::GetMemoryUsageBytes() const {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     uint64_t bytes = 0;
     for (int i = 0; i < num_bitmaps; ++i) {
         bytes += bitmaps[i].getSizeInBytes();
@@ -630,7 +630,7 @@ uint64_t BitmapTable::GetMemoryUsageBytes() const {
 }
 
 uint64_t BitmapTable::GetTotalBitSize() const {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     uint64_t bits = 0;
     for (int i = 0; i < num_bitmaps; ++i) {
         bits += bitmaps[i].cardinality();
@@ -642,8 +642,11 @@ uint64_t BitmapTable::GetCompressionRatio() const {
     if (num_bitmaps == 0) {
         return 1;
     }
-    std::lock_guard<std::mutex> guard(g_lock);
-    uint64_t compressed = GetMemoryUsageBytes();
+    std::shared_lock<std::shared_mutex> guard(g_lock);
+    uint64_t compressed = 0;
+    for (int i = 0; i < num_bitmaps; ++i) {
+        compressed += bitmaps[i].getSizeInBytes();
+    }
     uint64_t uncompressed = 0;
     for (int i = 0; i < num_bitmaps; ++i) {
         uint64_t max_row = bitmaps[i].maximum();
@@ -657,7 +660,7 @@ uint64_t BitmapTable::GetCompressionRatio() const {
 
 std::vector<std::string> BitmapTable::GetDistinctValues() const {
     std::vector<std::string> result;
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     for (int value = 0; value < num_bitmaps; ++value) {
         if (bitmaps[value].cardinality() > 0) {
             result.push_back(std::to_string(value));
@@ -667,7 +670,7 @@ std::vector<std::string> BitmapTable::GetDistinctValues() const {
 }
 
 void BitmapTable::GetRowsForValue(int value, std::vector<row_t> &out) const {
-    std::lock_guard<std::mutex> guard(g_lock);
+    std::shared_lock<std::shared_mutex> guard(g_lock);
     if (value < 0 || value >= num_bitmaps) return;
     // get values
     const auto &bitmap = bitmaps[value];
