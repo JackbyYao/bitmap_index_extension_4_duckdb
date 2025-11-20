@@ -16,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <shared_mutex>
 
 namespace duckdb {
 
@@ -26,7 +27,7 @@ struct BitmapConfig {
 struct BitmapDictionary {
 	std::unordered_map<std::string, int> value_to_id;
 	std::vector<std::string> id_to_value;
-	std::mutex lock;
+	mutable std::shared_mutex lock;
 };
 
 class PhysicalOperator;
