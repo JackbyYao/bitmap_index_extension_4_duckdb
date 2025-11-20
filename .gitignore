@@ -14,3 +14,5 @@ bitmap_idx
 .out.txt
 
 .clangd
+
+benchmark-results/
