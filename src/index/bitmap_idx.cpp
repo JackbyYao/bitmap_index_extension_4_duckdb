@@ -248,6 +248,14 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 	row_identifiers.ToUnifiedFormat(count, rowid_data);
 	auto value_type = value_vector.GetType().id();
 
+	// Cache for chunk-local string ids and pending inserts (VARCHAR only)
+	std::unordered_map<std::string, int32_t> local_string_cache;
+	std::unordered_map<std::string, std::vector<uint64_t>> pending_string_rows;
+	if (value_type == LogicalTypeId::VARCHAR) {
+		local_string_cache.reserve(count);
+		pending_string_rows.reserve(count / 4 + 1);
+	}
+
 	// Collect all updates for batch processing
 	std::vector<std::pair<uint64_t, int>> batch_updates;
 	batch_updates.reserve(count);
@@ -268,6 +276,7 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		// set the bitmap for that row
 		idx_t physical_index = value_data.sel->get_index(i);
 		int64_t value = 0;
+		bool skip_append = false;
 		switch (value_type) {
 		case LogicalTypeId::BOOLEAN:
 		case LogicalTypeId::TINYINT:
@@ -294,17 +303,42 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		case LogicalTypeId::UBIGINT:
 			value = static_cast<int64_t>(reinterpret_cast<uint64_t *>(value_data.data)[physical_index]);
 			break;
-	case LogicalTypeId::VARCHAR: {
-		// Extract string_t directly from the unified vector data to avoid constructing Value
-		auto string_data = reinterpret_cast<string_t *>(value_data.data);
-		string_t str_t = string_data[physical_index];
-		string s = str_t.GetString();
-		int id = GetOrAddValueId(s);
-		value = id;
-		break;
-	}
+		case LogicalTypeId::VARCHAR: {
+			// Extract string_t directly from the unified vector data to avoid constructing Value
+			auto string_data = reinterpret_cast<string_t *>(value_data.data);
+			string_t str_t = string_data[physical_index];
+			string s = str_t.GetString();
+
+			auto cache_it = local_string_cache.find(s);
+			if (cache_it != local_string_cache.end()) {
+				value = cache_it->second;
+				break;
+			}
+
+			auto pending_it = pending_string_rows.find(s);
+			if (pending_it != pending_string_rows.end()) {
+				pending_it->second.push_back(rowid);
+				skip_append = true;
+				break;
+			}
+
+			int id = LookupValueId(s);
+			if (id >= 0) {
+				local_string_cache.emplace(std::move(s), id);
+				value = id;
+			} else {
+				auto insert_res = pending_string_rows.emplace(std::move(s), std::vector<uint64_t> {});
+				insert_res.first->second.push_back(rowid);
+				skip_append = true;
+			}
+			break;
+		}
 		default:
 			throw NotImplementedException("Bitmap index currently supports only integer-like types");
+		}
+
+		if (skip_append) {
+			continue;
 		}
 
 		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
@@ -315,7 +349,27 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 
 	// Process clears (use negative value to indicate clear in batch API)
 	for (uint64_t rowid : rows_to_clear) {
-		batch_updates.push_back({rowid, -1});
+		batch_updates.emplace_back(rowid, -1);
+	}
+
+	// Process pending VARCHAR values in a single dictionary update
+	if (!pending_string_rows.empty()) {
+		std::unique_lock<std::shared_mutex> write_lock(dictionary->lock);
+		for (auto &entry : pending_string_rows) {
+			const string &pending_value = entry.first;
+			auto dict_it = dictionary->value_to_id.find(pending_value);
+			int id = 0;
+			if (dict_it != dictionary->value_to_id.end()) {
+				id = dict_it->second;
+			} else {
+				id = static_cast<int>(dictionary->id_to_value.size());
+				dictionary->id_to_value.push_back(pending_value);
+				dictionary->value_to_id[pending_value] = id;
+			}
+			for (auto rowid : entry.second) {
+				batch_updates.emplace_back(rowid, id);
+			}
+		}
 	}
 
 	// Batch process all updates at once
