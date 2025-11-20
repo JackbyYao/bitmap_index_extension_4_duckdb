@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_NAME=$(basename "$REPO_DIR")
+BRANCH_NAME=$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")
+BRANCH_TAG=$(echo "$BRANCH_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')
 
 DUCKDB_BIN="${REPO_DIR}/build/release/duckdb"
 EXTENSION_PATH="$(realpath "${REPO_DIR}/build/release/extension/bitmap_idx/bitmap_idx.duckdb_extension")"
@@ -17,12 +19,12 @@ DATESTAMP=$(date +"%Y%m%d-%H%M%S")
 
 mkdir -p "${RESULT_DIR}"
 
-OUT_WITH_EXT="${RESULT_DIR}/${DATESTAMP}-with-extension.txt"
-OUT_BASELINE="${RESULT_DIR}/${DATESTAMP}-baseline.txt"
+OUT_WITH_EXT="${RESULT_DIR}/${DATESTAMP}-${BRANCH_TAG}-with-extension.txt"
+OUT_BASELINE="${RESULT_DIR}/${DATESTAMP}-${BRANCH_TAG}-baseline.txt"
 
-# aligned folders for per-query tests
-WITH_DIR="${RESULT_DIR}/${DATESTAMP}-per-query-with"
-BASE_DIR="${RESULT_DIR}/${DATESTAMP}-per-query-baseline"
+# aligned folders for per-query tests·
+WITH_DIR="${RESULT_DIR}/${DATESTAMP}-${BRANCH_TAG}-per-query-with"
+BASE_DIR="${RESULT_DIR}/${DATESTAMP}-${BRANCH_TAG}-per-query-baseline"
 mkdir -p "$WITH_DIR" "$BASE_DIR"
 
 # Clean DuckDB logs (in case they exist)
@@ -59,7 +61,7 @@ INSTALL '${EXTENSION_PATH}';
 LOAD '${EXTENSION_NAME}';
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=1);
+CALL dbgen(sf=0.01);
 
 -- indexes (same as global run)
 CREATE INDEX C_MKTSEGMENT_idx ON CUSTOMER USING BITMAP (C_MKTSEGMENT);
@@ -82,7 +84,7 @@ EOF
     timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${BASE_DIR}/q${q}.out" 2>&1
 INSTALL tpch;
 LOAD tpch;
-CALL dbgen(sf=1);
+CALL dbgen(sf=0.01);
 -- CUSTOMER table
 CREATE INDEX C_MKTSEGMENT_art_idx ON CUSTOMER (C_MKTSEGMENT);
 CREATE INDEX C_NATIONKEY_art_idx ON CUSTOMER (C_NATIONKEY);
