@@ -50,7 +50,7 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
                        const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                        const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db,
                        const case_insensitive_map_t<Value> &options, const IndexStorageInfo &info,
-                       idx_t estimated_cardinality)
+                       idx_t estimated_cardinality, shared_ptr<BitmapDictionary> shared_dictionary)
     : BoundIndex(name, TYPE_NAME, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
 
 	if (index_constraint_type != IndexConstraintType::NONE) {
@@ -68,6 +68,12 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 
 	bitmap_table = make_uniq<BitmapTable>(&table_config);
 
+	if (shared_dictionary) {
+		dictionary = std::move(shared_dictionary);
+	} else {
+		dictionary = make_shared_ptr<BitmapDictionary>();
+	}
+
 	if(info.IsValid()){
 		// TODO: 从磁盘恢复索引数据
 	}
@@ -75,33 +81,37 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 
 // VARCHAR support
 int BitmapIndex::GetOrAddValueId(const string &val) {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	auto it = value_to_id.find(val);
-	if (it != value_to_id.end()) return it->second;
-	int id = static_cast<int>(id_to_value.size());
-	id_to_value.push_back(val);
-	value_to_id[val] = id;
+	std::lock_guard<std::mutex> guard(dictionary->lock);
+	auto it = dictionary->value_to_id.find(val);
+	if (it != dictionary->value_to_id.end()) {
+		return it->second;
+	}
+	int id = static_cast<int>(dictionary->id_to_value.size());
+	dictionary->id_to_value.push_back(val);
+	dictionary->value_to_id[val] = id;
 	return id;
 }
 
 int BitmapIndex::LookupValueId(const string &val) const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	auto it = value_to_id.find(val);
-	if (it == value_to_id.end()) return -1;
+	std::lock_guard<std::mutex> guard(dictionary->lock);
+	auto it = dictionary->value_to_id.find(val);
+	if (it == dictionary->value_to_id.end()) {
+		return -1;
+	}
 	return it->second;
 }
 
 string BitmapIndex::LookupValueString(int id) const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	if (id < 0 || id >= static_cast<int>(id_to_value.size())) {
+	std::lock_guard<std::mutex> guard(dictionary->lock);
+	if (id < 0 || id >= static_cast<int>(dictionary->id_to_value.size())) {
 		return std::to_string(id);
 	}
-	return id_to_value[id];
+	return dictionary->id_to_value[id];
 }
 
 bool BitmapIndex::UsesDictionary() const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	return !id_to_value.empty();
+	std::lock_guard<std::mutex> guard(dictionary->lock);
+	return !dictionary->id_to_value.empty();
 }
 
 unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
@@ -399,8 +409,8 @@ std::vector<std::string> BitmapIndex::GetDistinctValues() const {
 	// If we haven't populated a dictionary (no VARCHAR support used), just
 	// return the bitmap table's existing distinct-values (original behavior).
 	{
-		std::lock_guard<std::mutex> guard(dict_lock);
-		if (id_to_value.empty()) {
+		std::lock_guard<std::mutex> guard(dictionary->lock);
+		if (dictionary->id_to_value.empty()) {
 			return bitmap_table->GetDistinctValues();
 		}
 	}

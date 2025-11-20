@@ -43,7 +43,6 @@ PhysicalCreateBitmapIndex::PhysicalCreateBitmapIndex(PhysicalPlan &physical_plan
 //-------------------------------------------------------------
 class CreateBitmapIndexLocalSinkState final : public LocalSinkState {
 public:
-	//! Local index for this thread
 	unique_ptr<BitmapIndex> local_index;
 };
 
@@ -88,24 +87,15 @@ unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(Client
 // Local Sink State
 //-------------------------------------------------------------
 unique_ptr<LocalSinkState> PhysicalCreateBitmapIndex::GetLocalSinkState(ExecutionContext &context) const {
-	auto state = make_uniq<CreateBitmapIndexLocalSinkState>();
+	return make_uniq<CreateBitmapIndexLocalSinkState>();
+}
 
-	// Create a local index for this thread (similar to ART implementation)
-	auto &storage = table.GetStorage();
-
-	state->local_index = make_uniq<BitmapIndex>(
-		info->index_name,
-		info->constraint_type,
-		storage_ids,
-		TableIOManager::Get(storage),
-		unbound_expressions,
-		storage.db,
-		info->options,
-		IndexStorageInfo(),
-		estimated_cardinality
-	);
-
-	return std::move(state);
+static unique_ptr<BitmapIndex> CreateLocalBitmapIndex(const PhysicalCreateBitmapIndex &op,
+                                                      BitmapIndex &global_index) {
+	auto &storage = op.table.GetStorage();
+	return make_uniq<BitmapIndex>(op.info->index_name, op.info->constraint_type, op.storage_ids,
+	                              TableIOManager::Get(storage), op.unbound_expressions, storage.db, op.info->options,
+	                              IndexStorageInfo(), op.estimated_cardinality, global_index.GetDictionary());
 }
 
 //-------------------------------------------------------------
@@ -113,8 +103,11 @@ unique_ptr<LocalSinkState> PhysicalCreateBitmapIndex::GetLocalSinkState(Executio
 //-------------------------------------------------------------
 SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSinkInput &input) const {
-	// Use local_index for parallel execution (no lock needed)
+	auto &gstate = input.global_state.Cast<CreateBitmapIndexGlobalState>();
 	auto &lstate = input.local_state.Cast<CreateBitmapIndexLocalSinkState>();
+	if (!lstate.local_index) {
+		lstate.local_index = CreateLocalBitmapIndex(*this, *gstate.bitmap_ptr);
+	}
 	auto &bitmap_index = *lstate.local_index;
 
 	D_ASSERT(chunk.ColumnCount() >= 1);
@@ -142,7 +135,6 @@ SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataCh
 
 	auto &rowid_vector = chunk.data[rowid_col_idx];
 
-	// No lock needed for local_index (each thread has its own)
 	IndexLock lock;
 	bitmap_index.InitializeLock(lock);
 	bitmap_index.Append(lock, key_chunk, rowid_vector);
@@ -158,8 +150,10 @@ SinkCombineResultType PhysicalCreateBitmapIndex::Combine(ExecutionContext &conte
 	auto &g_state = input.global_state.Cast<CreateBitmapIndexGlobalState>();
 	auto &l_state = input.local_state.Cast<CreateBitmapIndexLocalSinkState>();
 
-	// Merge the local index into the global index
-	// Get bitmap tables
+	if (!l_state.local_index) {
+		return SinkCombineResultType::FINISHED;
+	}
+
 	auto &global_bitmap_table = g_state.bitmap_ptr->bitmap_table;
 	auto &local_bitmap_table = l_state.local_index->bitmap_table;
 
@@ -167,9 +161,7 @@ SinkCombineResultType PhysicalCreateBitmapIndex::Combine(ExecutionContext &conte
 		return SinkCombineResultType::FINISHED;
 	}
 
-	// Use the public MergeFrom method to merge local into global
 	global_bitmap_table->MergeFrom(*local_bitmap_table);
-
 	return SinkCombineResultType::FINISHED;
 }
 
