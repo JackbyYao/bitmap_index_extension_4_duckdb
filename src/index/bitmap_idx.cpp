@@ -11,6 +11,7 @@
 #include "duckdb/main/database.hpp"
 // #include "duckdb/common/types/unified_vector_format.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/exception.hpp"
@@ -133,7 +134,7 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
         return nullptr;
     }
 
-	std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
+	// std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
 
 	// No filter or NULL filter -> default full-scan
 		if (!filter_value || filter_value->IsNull()) {
@@ -149,7 +150,7 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 				return InitializeScan();
 			}
 			// Resolve string -> id
-			const string sval = filter_value->ToString();
+			const string sval = StringValue::Get(*filter_value);
 			int id = LookupValueId(sval);
 			vector<row_t> matches;
 			if (id >= 0 && bitmap_table) {
@@ -283,15 +284,15 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		case LogicalTypeId::UBIGINT:
 			value = static_cast<int64_t>(reinterpret_cast<uint64_t *>(value_data.data)[physical_index]);
 			break;
-		case LogicalTypeId::VARCHAR: {
-			// VARCHAR support, For better performance, extract the underlying string_t from the
-			// UnifiedVectorFormat data pointer. (since currenly we're creating key string on the fly)
-			Value v = value_vector.GetValue(physical_index);
-			string s = v.ToString();
-			int id = GetOrAddValueId(s);
-			value = id;
-			break;
-		}
+	case LogicalTypeId::VARCHAR: {
+		// Extract string_t directly from the unified vector data to avoid constructing Value
+		auto string_data = reinterpret_cast<string_t *>(value_data.data);
+		string_t str_t = string_data[physical_index];
+		string s = str_t.GetString();
+		int id = GetOrAddValueId(s);
+		value = id;
+		break;
+	}
 		default:
 			throw NotImplementedException("Bitmap index currently supports only integer-like types");
 		}
@@ -299,7 +300,7 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
 			throw OutOfRangeException("Bitmap index value %lld exceeds 32-bit storage bounds", value);
 		}
-		batch_updates.push_back({rowid, static_cast<int32_t>(value)});
+		batch_updates.emplace_back(rowid, static_cast<int32_t>(value));
 	}
 
 	// Process clears (use negative value to indicate clear in batch API)
