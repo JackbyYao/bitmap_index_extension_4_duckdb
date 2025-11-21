@@ -293,6 +293,13 @@ public:
 		get.estimated_cardinality = cardinality->estimated_cardinality;
 		get.bind_data = std::move(bind_data);
 
+		if (filter_column_idx.IsValid()) {
+			auto it = get.table_filters.filters.find(filter_column_idx.GetIndex());
+			if (it != get.table_filters.filters.end()) {
+				get.table_filters.filters.erase(it);
+			}
+		}
+
 		// If there are no table filters pushed down, replacement is done
 		if (get.table_filters.filters.empty()) {
 			return true;
