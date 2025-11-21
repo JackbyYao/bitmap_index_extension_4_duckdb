@@ -16,8 +16,12 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/transaction/transaction_data.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include <algorithm>
 #include <string>
 
@@ -37,7 +41,6 @@ struct BitmapIndexScanGlobalState final : public GlobalTableFunctionState {
 	DataChunk all_columns;
 	vector<idx_t> projection_ids;
 
-	ColumnFetchState fetch_state;
 	TableScanState local_storage_state;
 	vector<StorageIndex> column_ids;
 
@@ -82,9 +85,29 @@ static void BuildRowGroupBatches(BitmapIndexScanGlobalState &state, idx_t row_gr
 	}
 }
 
+static void GatherRows(RowGroup &row_group, TransactionData &transaction_data, const vector<StorageIndex> &column_ids,
+                       const SelectionVector &sel, idx_t valid_count, idx_t local_vector_index, DataChunk &result,
+                       idx_t offset) {
+	for (idx_t col_idx = 0; col_idx < column_ids.size(); col_idx++) {
+		auto &column = column_ids[col_idx];
+		auto &result_vector = result.data[col_idx];
+		auto &col_data = row_group.GetColumnRef(column);
+
+		ColumnScanState scan_state;
+		scan_state.Initialize(col_data.type, column.GetChildIndexes(), nullptr);
+		auto vector_start = row_group.start + local_vector_index * STANDARD_VECTOR_SIZE;
+		col_data.InitializeScanWithOffset(scan_state, vector_start);
+
+		Vector temp(col_data.type);
+		auto global_vector_index = vector_start / STANDARD_VECTOR_SIZE;
+		col_data.Scan(transaction_data, global_vector_index, scan_state, temp);
+		temp.Slice(sel, valid_count);
+		VectorOperations::Copy(temp, result_vector, valid_count, 0, offset);
+	}
+}
+
 static idx_t ConsumeBatch(DataTable &storage, DuckTransaction &transaction, const vector<StorageIndex> &column_ids,
-                          ColumnFetchState &fetch_state, BitmapIndexScanGlobalState::RowGroupBatch &batch,
-                          DataChunk &result, idx_t offset) {
+                          BitmapIndexScanGlobalState::RowGroupBatch &batch, DataChunk &result, idx_t offset) {
 	if (batch.row_group_index == DConstants::INVALID_INDEX || batch.row_ids.empty()) {
 		return offset;
 	}
@@ -93,13 +116,39 @@ static idx_t ConsumeBatch(DataTable &storage, DuckTransaction &transaction, cons
 	if (!row_group) {
 		return offset;
 	}
-	for (auto row_id : batch.row_ids) {
-		auto local_row = UnsafeNumericCast<idx_t>(row_id) - row_group->start;
-		if (!row_group->Fetch(transaction, local_row)) {
+	TransactionData transaction_data(transaction);
+
+	idx_t batch_offset = 0;
+	while (batch_offset < batch.row_ids.size() && offset < STANDARD_VECTOR_SIZE) {
+		SelectionVector sel(STANDARD_VECTOR_SIZE);
+		idx_t valid_count = 0;
+		idx_t local_vector_index = DConstants::INVALID_INDEX;
+		idx_t chunk_start = 0;
+
+		while (batch_offset < batch.row_ids.size() && valid_count < STANDARD_VECTOR_SIZE &&
+		       offset + valid_count < STANDARD_VECTOR_SIZE) {
+			auto row_id = batch.row_ids[batch_offset];
+			auto local_row = UnsafeNumericCast<idx_t>(row_id) - row_group->start;
+			idx_t current_vector = local_row / STANDARD_VECTOR_SIZE;
+			if (local_vector_index == DConstants::INVALID_INDEX) {
+				local_vector_index = current_vector;
+				chunk_start = local_vector_index * STANDARD_VECTOR_SIZE;
+			} else if (current_vector != local_vector_index) {
+				break;
+			}
+			if (row_group->Fetch(transaction_data, local_row)) {
+				sel.set_index(valid_count++, UnsafeNumericCast<sel_t>(local_row - chunk_start));
+			}
+			batch_offset++;
+		}
+
+		if (valid_count == 0) {
+			local_vector_index = DConstants::INVALID_INDEX;
 			continue;
 		}
-		row_group->FetchRow(transaction, fetch_state, column_ids, row_id, result, offset);
-		offset++;
+
+		GatherRows(*row_group, transaction_data, column_ids, sel, valid_count, local_vector_index, result, offset);
+		offset += valid_count;
 	}
 	return offset;
 }
@@ -200,8 +249,7 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 
 		while (state.next_batch < state.batches.size() && produced < STANDARD_VECTOR_SIZE) {
 			auto &batch = state.batches[state.next_batch];
-			produced = ConsumeBatch(storage, transaction, state.column_ids, state.fetch_state, batch, target_chunk,
-			                        produced);
+			produced = ConsumeBatch(storage, transaction, state.column_ids, batch, target_chunk, produced);
 			state.next_batch++;
 		}
 	}
