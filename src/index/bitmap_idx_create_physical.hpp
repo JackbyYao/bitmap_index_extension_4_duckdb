@@ -48,7 +48,7 @@ public:
 	}
 	bool ParallelSink() const override {
 		// Enable parallel execution like ART index
-		return true;
+		return false;
 	}
 };
 

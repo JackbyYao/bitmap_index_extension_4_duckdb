@@ -253,73 +253,93 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 	};
 
 	auto &target_chunk = state.all_columns;
-	target_chunk.Reset();
-	idx_t produced = 0;
-
-	while (produced < STANDARD_VECTOR_SIZE) {
-		if (!ensure_batches()) {
+	
+	// Use do-while loop similar to table_scan.cpp
+	// The loop continues until we get data or confirm there's no more data
+	// Unlike table_scan which uses NextParallelScan, we use ensure_batches() to get more data
+	do {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		
+		target_chunk.Reset();
+		idx_t produced = 0;
+		
+		// Try to get data from batches
+		while (produced < STANDARD_VECTOR_SIZE) {
+			if (!ensure_batches()) {
+				// No more batches from index, break to try local_storage
+				break;
+			}
+			
+			while (state.next_batch < state.batches.size() && produced < STANDARD_VECTOR_SIZE) {
+				auto &batch = state.batches[state.next_batch];
+				produced = ConsumeBatch(storage, transaction, state.column_ids, batch, target_chunk, produced);
+				state.next_batch++;
+			}
+		}
+		
+		target_chunk.SetCardinality(produced);
+		
+		// If we got data from batches, process and return
+		if (produced > 0) {
+			if (state.projection_ids.empty()) {
+				output.Move(target_chunk);
+			} else {
+				// Ensure output is initialized with correct column count
+				if (output.ColumnCount() != state.projection_ids.size()) {
+					vector<LogicalType> output_types;
+					output_types.reserve(state.projection_ids.size());
+					for (auto &proj_id : state.projection_ids) {
+						if (proj_id >= target_chunk.ColumnCount()) {
+							throw InternalException("Projection index %llu out of range (column count: %llu)", 
+							                        proj_id, target_chunk.ColumnCount());
+						}
+						output_types.push_back(target_chunk.data[proj_id].GetType());
+					}
+					output.Initialize(context, output_types);
+				}
+				output.ReferenceColumns(target_chunk, state.projection_ids);
+			}
+			if (output.size() > 0) {
+				return;
+			}
+		}
+		
+		// No data from batches, try local_storage (only when batches are exhausted)
+		// This follows the pattern from DuckIndexScanState::TableScanFunc
+		if (produced == 0) {
+			state.all_columns.Reset();
 			if (state.projection_ids.empty()) {
 				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
 			} else {
-				state.all_columns.Reset();
 				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+				// Ensure output is initialized with correct column count
+				if (output.ColumnCount() != state.projection_ids.size()) {
+					vector<LogicalType> output_types;
+					output_types.reserve(state.projection_ids.size());
+					for (auto &proj_id : state.projection_ids) {
+						if (proj_id >= state.all_columns.ColumnCount()) {
+							throw InternalException("Projection index %llu out of range (column count: %llu)", 
+							                        proj_id, state.all_columns.ColumnCount());
+						}
+						output_types.push_back(state.all_columns.data[proj_id].GetType());
+					}
+					output.Initialize(context, output_types);
+				}
 				output.ReferenceColumns(state.all_columns, state.projection_ids);
 			}
-			return;
-		}
-
-		while (state.next_batch < state.batches.size() && produced < STANDARD_VECTOR_SIZE) {
-			auto &batch = state.batches[state.next_batch];
-			produced = ConsumeBatch(storage, transaction, state.column_ids, batch, target_chunk, produced);
-			state.next_batch++;
-		}
-	}
-
-	target_chunk.SetCardinality(produced);
-	
-	// If no data produced, scan from local storage
-	if (produced == 0) {
-		state.all_columns.Reset();
-		local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
-		produced = state.all_columns.size();
-	}
-	
-	// Handle output based on whether we need projection
-	if (state.projection_ids.empty()) {
-		// No projection needed, directly move the data
-		if (produced > 0) {
-			output.Move(target_chunk);
-		} else {
-			output.Move(state.all_columns);
-		}
-	} else {
-		// Projection needed, use ReferenceColumns (output should be initialized by executor)
-		// Use target_chunk if we have data, otherwise use all_columns
-		DataChunk &source_chunk = (produced > 0) ? target_chunk : state.all_columns;
-		
-		// Ensure output is initialized with correct column count
-		if (output.ColumnCount() != state.projection_ids.size()) {
-			vector<LogicalType> output_types;
-			output_types.reserve(state.projection_ids.size());
-			for (auto &proj_id : state.projection_ids) {
-				// Get the type from source_chunk
-				if (proj_id >= source_chunk.ColumnCount()) {
-					throw InternalException("Projection index %llu out of range (column count: %llu)", 
-					                        proj_id, source_chunk.ColumnCount());
-				}
-				output_types.push_back(source_chunk.data[proj_id].GetType());
+			if (output.size() > 0) {
+				return;
 			}
-			output.Initialize(context, output_types);
 		}
 		
-		// Verify source_chunk has enough columns
-		if (source_chunk.ColumnCount() == 0) {
-			output.SetCardinality(0);
-			return;
-		}
-		
-		output.ReferenceColumns(source_chunk, state.projection_ids);
-	}
+		// No data from either batches or local_storage, and no more batches available
+		// This means we're done - return empty result
+		// The function will be called again by the executor if there might be more data
+		// We exit the loop here because ensure_batches() returned false, meaning no more index data
+		return;
+	} while (false); // Only execute once per function call, but use do-while for consistency with table_scan pattern
 }
 
 //-------------------------------------------------------------------------
