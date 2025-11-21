@@ -16,6 +16,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include <algorithm>
 #include <string>
 
 namespace duckdb {
@@ -42,6 +45,52 @@ struct BitmapIndexScanGlobalState final : public GlobalTableFunctionState {
 	unique_ptr<IndexScanState> index_state;
 	Vector row_ids = Vector(LogicalType::ROW_TYPE);
 };
+
+static idx_t FetchGroupedByRowGroup(DataTable &storage, DuckTransaction &transaction, DataChunk &result,
+                                    const vector<StorageIndex> &column_ids, Vector &row_ids, idx_t fetch_count,
+                                    ColumnFetchState &fetch_state) {
+	if (fetch_count == 0) {
+		result.SetCardinality(0);
+		return 0;
+	}
+
+	auto row_id_ptr = FlatVector::GetData<row_t>(row_ids);
+	vector<row_t> sorted_ids;
+	sorted_ids.reserve(fetch_count);
+	for (idx_t i = 0; i < fetch_count; i++) {
+		sorted_ids.push_back(row_id_ptr[i]);
+	}
+	std::sort(sorted_ids.begin(), sorted_ids.end());
+
+	auto &collection = storage.GetRowGroups();
+	auto row_group_size = storage.GetRowGroupSize();
+	if (row_group_size == 0) {
+		row_group_size = 1;
+	}
+
+	idx_t output_count = 0;
+	RowGroup *current_group = nullptr;
+	idx_t current_group_idx = DConstants::INVALID_INDEX;
+
+	for (auto row_id : sorted_ids) {
+		idx_t group_idx = UnsafeNumericCast<idx_t>(row_id) / row_group_size;
+		if (!current_group || group_idx != current_group_idx) {
+			current_group = collection.GetRowGroup(UnsafeNumericCast<int64_t>(group_idx));
+			current_group_idx = group_idx;
+		}
+		if (!current_group) {
+			continue;
+		}
+		auto local_row = UnsafeNumericCast<idx_t>(row_id) - current_group->start;
+		if (!current_group->Fetch(transaction, local_row)) {
+			continue;
+		}
+		current_group->FetchRow(transaction, fetch_state, column_ids, row_id, result, output_count);
+		output_count++;
+	}
+	result.SetCardinality(output_count);
+	return output_count;
+}
 
 static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
@@ -100,28 +149,49 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
     auto &bind_data = data_p.bind_data->Cast<BitmapIndexScanBindData>();
 	auto &state = data_p.global_state->Cast<BitmapIndexScanGlobalState>();
 	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+	auto &storage = bind_data.table.GetStorage();
 
 	// Scan the index for row id's
 	auto row_count = bind_data.index.Cast<BitmapIndex>().Scan(*state.index_state, state.row_ids);
 	if (row_count == 0) {
-		// No more matching rows
-		output.SetCardinality(0);
+		// No more matching rows in the persistent table, fall back to local storage
+		auto &local_storage = LocalStorage::Get(transaction);
+		if (state.projection_ids.empty()) {
+			local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
+		} else {
+			state.all_columns.Reset();
+			local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+			output.ReferenceColumns(state.all_columns, state.projection_ids);
+		}
 		return;
 	}
 
 	// Fetch the data from the local storage given the row ids
 	if (state.projection_ids.empty()) {
-		// Directly fetch columns into output
-		bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids,
-		                                   state.row_ids, row_count, state.fetch_state);
+		auto produced = FetchGroupedByRowGroup(storage, transaction, output, state.column_ids, state.row_ids,
+		                                       row_count, state.fetch_state);
+		if (produced == 0) {
+			auto &local_storage = LocalStorage::Get(transaction);
+			local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
+		}
 		return;
 	}
 
 	// Otherwise, we need to first fetch into our scan chunk, and then project out the result
 	state.all_columns.Reset();
-	bind_data.table.GetStorage().Fetch(transaction, state.all_columns, state.column_ids,
-	                                   state.row_ids, row_count, state.fetch_state);
-
+	auto fetched = FetchGroupedByRowGroup(storage, transaction, state.all_columns, state.column_ids, state.row_ids,
+	                                      row_count, state.fetch_state);
+	if (fetched == 0) {
+		auto &local_storage = LocalStorage::Get(transaction);
+		state.all_columns.Reset();
+		local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+		if (state.all_columns.size() == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+		output.ReferenceColumns(state.all_columns, state.projection_ids);
+		return;
+	}
 	output.ReferenceColumns(state.all_columns, state.projection_ids);
 }
 
