@@ -34,9 +34,12 @@ public:
 	}
 
 public:
+	//! Sink interface, local sink state (for parallel execution)
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	//! Sink interface, global sink state
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
 
@@ -44,8 +47,8 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		// Not parallel, the sink order is important
-		return false;
+		// Enable parallel execution like ART index
+		return true;
 	}
 };
 

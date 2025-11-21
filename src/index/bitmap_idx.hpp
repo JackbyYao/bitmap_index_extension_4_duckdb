@@ -15,11 +15,19 @@
 #include <mutex>
 #include <vector>
 #include <string>
+#include <memory>
+#include <shared_mutex>
 
 namespace duckdb {
 
 struct BitmapConfig {
 	idx_t bitmap_cardinality = 0;
+};
+
+struct BitmapDictionary {
+	std::unordered_map<std::string, int> value_to_id;
+	std::vector<std::string> id_to_value;
+	mutable std::shared_mutex lock;
 };
 
 class PhysicalOperator;
@@ -31,17 +39,15 @@ public:
 	BitmapIndex(const string &name, IndexConstraintType index_constraint_type, const vector<column_t> &column_ids,
 	           TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
 	           AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
-	           const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0);
+	           const IndexStorageInfo &info = IndexStorageInfo(), idx_t estimated_cardinality = 0,
+	           shared_ptr<BitmapDictionary> shared_dictionary = nullptr);
 	BitmapConfig bitmap_config;
 	Table_config table_config;
 	unique_ptr<BitmapTable> bitmap_table;
 
 //---------- This section is added for VARCHAR support
 	// Dictionary encoding for VARCHAR support: maps string values to small int ids
-	std::unordered_map<std::string, int> value_to_id;
-	std::vector<std::string> id_to_value;
-	mutable std::mutex dict_lock;
-
+	shared_ptr<BitmapDictionary> dictionary;
 	// Dictionary helper APIs
 	// Get existing id for `val` or create a new one.
 	int GetOrAddValueId(const std::string &val);
@@ -49,6 +55,9 @@ public:
 	int LookupValueId(const std::string &val) const;
 	// Lookup string value for `id`; returns numeric fallback if missing.
 	std::string LookupValueString(int id) const;
+	shared_ptr<BitmapDictionary> GetDictionary() const {
+		return dictionary;
+	}
 
 	unique_ptr<IndexScanState> InitializeScan(const Value *filter_value) const;
 

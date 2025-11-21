@@ -11,6 +11,7 @@
 #include "duckdb/main/database.hpp"
 // #include "duckdb/common/types/unified_vector_format.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/exception.hpp"
@@ -50,7 +51,7 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
                        const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                        const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db,
                        const case_insensitive_map_t<Value> &options, const IndexStorageInfo &info,
-                       idx_t estimated_cardinality)
+                       idx_t estimated_cardinality, shared_ptr<BitmapDictionary> shared_dictionary)
     : BoundIndex(name, TYPE_NAME, index_constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
 
 	if (index_constraint_type != IndexConstraintType::NONE) {
@@ -68,6 +69,12 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 
 	bitmap_table = make_uniq<BitmapTable>(&table_config);
 
+	if (shared_dictionary) {
+		dictionary = std::move(shared_dictionary);
+	} else {
+		dictionary = make_shared_ptr<BitmapDictionary>();
+	}
+
 	if(info.IsValid()){
 		// TODO: 从磁盘恢复索引数据
 	}
@@ -75,33 +82,47 @@ BitmapIndex::BitmapIndex(const string &name, IndexConstraintType index_constrain
 
 // VARCHAR support
 int BitmapIndex::GetOrAddValueId(const string &val) {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	auto it = value_to_id.find(val);
-	if (it != value_to_id.end()) return it->second;
-	int id = static_cast<int>(id_to_value.size());
-	id_to_value.push_back(val);
-	value_to_id[val] = id;
+	// read
+	{
+		std::shared_lock<std::shared_mutex> read_lock(dictionary->lock);
+		auto it = dictionary->value_to_id.find(val);
+		if (it != dictionary->value_to_id.end()) {
+			return it->second;
+		}
+	}
+
+	// write
+	std::unique_lock<std::shared_mutex> write_lock(dictionary->lock);
+	auto it = dictionary->value_to_id.find(val);
+	if (it != dictionary->value_to_id.end()) {
+		return it->second;
+	}
+	int id = static_cast<int>(dictionary->id_to_value.size());
+	dictionary->id_to_value.push_back(val);
+	dictionary->value_to_id[val] = id;
 	return id;
 }
 
 int BitmapIndex::LookupValueId(const string &val) const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	auto it = value_to_id.find(val);
-	if (it == value_to_id.end()) return -1;
+	std::shared_lock<std::shared_mutex> guard(dictionary->lock);
+	auto it = dictionary->value_to_id.find(val);
+	if (it == dictionary->value_to_id.end()) {
+		return -1;
+	}
 	return it->second;
 }
 
 string BitmapIndex::LookupValueString(int id) const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	if (id < 0 || id >= static_cast<int>(id_to_value.size())) {
+	std::shared_lock<std::shared_mutex> guard(dictionary->lock);
+	if (id < 0 || id >= static_cast<int>(dictionary->id_to_value.size())) {
 		return std::to_string(id);
 	}
-	return id_to_value[id];
+	return dictionary->id_to_value[id];
 }
 
 bool BitmapIndex::UsesDictionary() const {
-	std::lock_guard<std::mutex> guard(dict_lock);
-	return !id_to_value.empty();
+	std::shared_lock<std::shared_mutex> guard(dictionary->lock);
+	return !dictionary->id_to_value.empty();
 }
 
 unique_ptr<IndexScanState> BitmapIndex::InitializeScan() const {
@@ -123,7 +144,7 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
         return nullptr;
     }
 
-	std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
+	// std::string fv = (!filter_value ? "<nullptr>" : filter_value->ToString());
 
 	// No filter or NULL filter -> default full-scan
 		if (!filter_value || filter_value->IsNull()) {
@@ -139,7 +160,7 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 				return InitializeScan();
 			}
 			// Resolve string -> id
-			const string sval = filter_value->ToString();
+			const string sval = StringValue::Get(*filter_value);
 			int id = LookupValueId(sval);
 			vector<row_t> matches;
 			if (id >= 0 && bitmap_table) {
@@ -227,6 +248,14 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 	row_identifiers.ToUnifiedFormat(count, rowid_data);
 	auto value_type = value_vector.GetType().id();
 
+	// Cache for chunk-local string ids and pending inserts (VARCHAR only)
+	std::unordered_map<std::string, int32_t> local_string_cache;
+	std::unordered_map<std::string, std::vector<uint64_t>> pending_string_rows;
+	if (value_type == LogicalTypeId::VARCHAR) {
+		local_string_cache.reserve(count);
+		pending_string_rows.reserve(count / 4 + 1);
+	}
+
 	// Collect all updates for batch processing
 	std::vector<std::pair<uint64_t, int>> batch_updates;
 	batch_updates.reserve(count);
@@ -247,6 +276,7 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 		// set the bitmap for that row
 		idx_t physical_index = value_data.sel->get_index(i);
 		int64_t value = 0;
+		bool skip_append = false;
 		switch (value_type) {
 		case LogicalTypeId::BOOLEAN:
 		case LogicalTypeId::TINYINT:
@@ -274,27 +304,72 @@ ErrorData BitmapIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_i
 			value = static_cast<int64_t>(reinterpret_cast<uint64_t *>(value_data.data)[physical_index]);
 			break;
 		case LogicalTypeId::VARCHAR: {
-			// VARCHAR support, For better performance, extract the underlying string_t from the
-			// UnifiedVectorFormat data pointer. (since currenly we're creating key string on the fly)
-			Value v = value_vector.GetValue(physical_index);
-			string s = v.ToString();
-			int id = GetOrAddValueId(s);
-			value = id;
+			// Extract string_t directly from the unified vector data to avoid constructing Value
+			auto string_data = reinterpret_cast<string_t *>(value_data.data);
+			string_t str_t = string_data[physical_index];
+			string s = str_t.GetString();
+
+			auto cache_it = local_string_cache.find(s);
+			if (cache_it != local_string_cache.end()) {
+				value = cache_it->second;
+				break;
+			}
+
+			auto pending_it = pending_string_rows.find(s);
+			if (pending_it != pending_string_rows.end()) {
+				pending_it->second.push_back(rowid);
+				skip_append = true;
+				break;
+			}
+
+			int id = LookupValueId(s);
+			if (id >= 0) {
+				local_string_cache.emplace(std::move(s), id);
+				value = id;
+			} else {
+				auto insert_res = pending_string_rows.emplace(std::move(s), std::vector<uint64_t> {});
+				insert_res.first->second.push_back(rowid);
+				skip_append = true;
+			}
 			break;
 		}
 		default:
 			throw NotImplementedException("Bitmap index currently supports only integer-like types");
 		}
 
+		if (skip_append) {
+			continue;
+		}
+
 		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
 			throw OutOfRangeException("Bitmap index value %lld exceeds 32-bit storage bounds", value);
 		}
-		batch_updates.push_back({rowid, static_cast<int32_t>(value)});
+		batch_updates.emplace_back(rowid, static_cast<int32_t>(value));
 	}
 
 	// Process clears (use negative value to indicate clear in batch API)
 	for (uint64_t rowid : rows_to_clear) {
-		batch_updates.push_back({rowid, -1});
+		batch_updates.emplace_back(rowid, -1);
+	}
+
+	// Process pending VARCHAR values in a single dictionary update
+	if (!pending_string_rows.empty()) {
+		std::unique_lock<std::shared_mutex> write_lock(dictionary->lock);
+		for (auto &entry : pending_string_rows) {
+			const string &pending_value = entry.first;
+			auto dict_it = dictionary->value_to_id.find(pending_value);
+			int id = 0;
+			if (dict_it != dictionary->value_to_id.end()) {
+				id = dict_it->second;
+			} else {
+				id = static_cast<int>(dictionary->id_to_value.size());
+				dictionary->id_to_value.push_back(pending_value);
+				dictionary->value_to_id[pending_value] = id;
+			}
+			for (auto rowid : entry.second) {
+				batch_updates.emplace_back(rowid, id);
+			}
+		}
 	}
 
 	// Batch process all updates at once
@@ -399,8 +474,8 @@ std::vector<std::string> BitmapIndex::GetDistinctValues() const {
 	// If we haven't populated a dictionary (no VARCHAR support used), just
 	// return the bitmap table's existing distinct-values (original behavior).
 	{
-		std::lock_guard<std::mutex> guard(dict_lock);
-		if (id_to_value.empty()) {
+		std::shared_lock<std::shared_mutex> guard(dictionary->lock);
+		if (dictionary->id_to_value.empty()) {
 			return bitmap_table->GetDistinctValues();
 		}
 	}
