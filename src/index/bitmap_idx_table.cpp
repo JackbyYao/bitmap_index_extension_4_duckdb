@@ -602,9 +602,41 @@ void BitmapTable::GetRowsForValue(int value, std::vector<row_t> &out) const {
     if (value < 0 || value >= num_bitmaps) return;
     // get values
     const auto &bitmap = bitmaps[value];
+    // Use CRoaring bulk array export for better performance
+    size_t card = bitmap.cardinality();
     out.clear();
-    out.reserve(bitmap.cardinality());
-    for (auto it = bitmap.begin(); it != bitmap.end(); ++it) {
-        out.push_back(static_cast<row_t>(*it));
+    out.resize(card);
+    if (card == 0) return;
+    if (sizeof(row_t) == sizeof(uint32_t)) {
+        // can write directly into the vector's buffer
+        bitmap.toUint32Array(reinterpret_cast<uint32_t *>(out.data()));
+    } else {
+        // widening path: write into temporary 32-bit buffer then widen
+        std::vector<uint32_t> tmp(card);
+        bitmap.toUint32Array(tmp.data());
+        for (size_t i = 0; i < card; ++i) {
+            out[i] = static_cast<row_t>(tmp[i]);
+        }
     }
+}
+
+size_t BitmapTable::GetRowsForValueChunk(int value, size_t offset, size_t limit, row_t *out_buf) const {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (value < 0 || value >= num_bitmaps) return 0;
+    const auto &bitmap = bitmaps[value];
+    size_t card = bitmap.cardinality();
+    if (offset >= card) return 0;
+    size_t to_copy = std::min(limit, card - offset);
+    if (to_copy == 0) return 0;
+
+    if (sizeof(row_t) == sizeof(uint32_t)) {
+        bitmap.rangeUint32Array(reinterpret_cast<uint32_t *>(out_buf), offset, to_copy);
+    } else {
+        std::vector<uint32_t> tmp(to_copy);
+        bitmap.rangeUint32Array(tmp.data(), offset, to_copy);
+        for (size_t i = 0; i < to_copy; ++i) {
+            out_buf[i] = static_cast<row_t>(tmp[i]);
+        }
+    }
+    return to_copy;
 }
