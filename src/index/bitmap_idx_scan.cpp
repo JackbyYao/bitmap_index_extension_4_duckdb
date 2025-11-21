@@ -16,6 +16,13 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/transaction/transaction_data.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
+#include <algorithm>
 #include <string>
 
 namespace duckdb {
@@ -34,14 +41,117 @@ struct BitmapIndexScanGlobalState final : public GlobalTableFunctionState {
 	DataChunk all_columns;
 	vector<idx_t> projection_ids;
 
-	ColumnFetchState fetch_state;
 	TableScanState local_storage_state;
 	vector<StorageIndex> column_ids;
 
 	// Index scan state
 	unique_ptr<IndexScanState> index_state;
 	Vector row_ids = Vector(LogicalType::ROW_TYPE);
+
+	struct RowGroupBatch {
+		idx_t row_group_index = DConstants::INVALID_INDEX;
+		vector<row_t> row_ids;
+	};
+	vector<RowGroupBatch> batches;
+	idx_t next_batch = 0;
 };
+
+static void BuildRowGroupBatches(BitmapIndexScanGlobalState &state, idx_t row_group_size, idx_t fetch_count) {
+	state.batches.clear();
+	state.next_batch = 0;
+	if (fetch_count == 0) {
+		return;
+	}
+	auto row_id_ptr = FlatVector::GetData<row_t>(state.row_ids);
+	vector<row_t> sorted_ids(row_id_ptr, row_id_ptr + fetch_count);
+	std::sort(sorted_ids.begin(), sorted_ids.end());
+
+	idx_t idx = 0;
+	while (idx < sorted_ids.size()) {
+		auto row_id = sorted_ids[idx];
+		idx_t group_idx = UnsafeNumericCast<idx_t>(row_id) / row_group_size;
+		BitmapIndexScanGlobalState::RowGroupBatch batch;
+		batch.row_group_index = group_idx;
+		while (idx < sorted_ids.size()) {
+			auto current = sorted_ids[idx];
+			auto current_group = UnsafeNumericCast<idx_t>(current) / row_group_size;
+			if (current_group != group_idx || batch.row_ids.size() >= STANDARD_VECTOR_SIZE) {
+				break;
+			}
+			batch.row_ids.push_back(current);
+			idx++;
+		}
+		state.batches.push_back(std::move(batch));
+	}
+}
+
+static void GatherRows(RowGroup &row_group, TransactionData &transaction_data, const vector<StorageIndex> &column_ids,
+                       const SelectionVector &sel, idx_t valid_count, idx_t local_vector_index, DataChunk &result,
+                       idx_t offset) {
+	for (idx_t col_idx = 0; col_idx < column_ids.size(); col_idx++) {
+		auto &column = column_ids[col_idx];
+		auto &result_vector = result.data[col_idx];
+		auto &col_data = row_group.GetColumnRef(column);
+
+		ColumnScanState scan_state;
+		scan_state.Initialize(col_data.type, column.GetChildIndexes(), nullptr);
+		auto vector_start = row_group.start + local_vector_index * STANDARD_VECTOR_SIZE;
+		col_data.InitializeScanWithOffset(scan_state, vector_start);
+
+		Vector temp(col_data.type);
+		auto global_vector_index = vector_start / STANDARD_VECTOR_SIZE;
+		col_data.Scan(transaction_data, global_vector_index, scan_state, temp);
+		temp.Slice(sel, valid_count);
+		VectorOperations::Copy(temp, result_vector, valid_count, 0, offset);
+	}
+}
+
+static idx_t ConsumeBatch(DataTable &storage, DuckTransaction &transaction, const vector<StorageIndex> &column_ids,
+                          BitmapIndexScanGlobalState::RowGroupBatch &batch, DataChunk &result, idx_t offset) {
+	if (batch.row_group_index == DConstants::INVALID_INDEX || batch.row_ids.empty()) {
+		return offset;
+	}
+	auto &collection = storage.GetRowGroups();
+	auto row_group = collection.GetRowGroup(UnsafeNumericCast<int64_t>(batch.row_group_index));
+	if (!row_group) {
+		return offset;
+	}
+	TransactionData transaction_data(transaction);
+
+	idx_t batch_offset = 0;
+	while (batch_offset < batch.row_ids.size() && offset < STANDARD_VECTOR_SIZE) {
+		SelectionVector sel(STANDARD_VECTOR_SIZE);
+		idx_t valid_count = 0;
+		idx_t local_vector_index = DConstants::INVALID_INDEX;
+		idx_t chunk_start = 0;
+
+		while (batch_offset < batch.row_ids.size() && valid_count < STANDARD_VECTOR_SIZE &&
+		       offset + valid_count < STANDARD_VECTOR_SIZE) {
+			auto row_id = batch.row_ids[batch_offset];
+			auto local_row = UnsafeNumericCast<idx_t>(row_id) - row_group->start;
+			idx_t current_vector = local_row / STANDARD_VECTOR_SIZE;
+			if (local_vector_index == DConstants::INVALID_INDEX) {
+				local_vector_index = current_vector;
+				chunk_start = local_vector_index * STANDARD_VECTOR_SIZE;
+			} else if (current_vector != local_vector_index) {
+				break;
+			}
+			if (row_group->Fetch(transaction_data, local_row)) {
+				sel.set_index(valid_count++, UnsafeNumericCast<sel_t>(local_row - chunk_start));
+			}
+			batch_offset++;
+		}
+
+		if (valid_count == 0) {
+			local_vector_index = DConstants::INVALID_INDEX;
+			continue;
+		}
+
+		GatherRows(*row_group, transaction_data, column_ids, sel, valid_count, local_vector_index, result, offset);
+		offset += valid_count;
+	}
+	return offset;
+}
 
 static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientContext &context,
                                                                      TableFunctionInitInput &input) {
@@ -100,29 +210,54 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
     auto &bind_data = data_p.bind_data->Cast<BitmapIndexScanBindData>();
 	auto &state = data_p.global_state->Cast<BitmapIndexScanGlobalState>();
 	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
+	auto &storage = bind_data.table.GetStorage();
+	auto &local_storage = LocalStorage::Get(transaction);
 
-	// Scan the index for row id's
-	auto row_count = bind_data.index.Cast<BitmapIndex>().Scan(*state.index_state, state.row_ids);
-	if (row_count == 0) {
-		// No more matching rows
-		output.SetCardinality(0);
-		return;
+	auto ensure_batches = [&]() -> bool {
+		if (state.next_batch < state.batches.size()) {
+			return true;
+		}
+		state.batches.clear();
+		state.next_batch = 0;
+		auto row_count = bind_data.index.Cast<BitmapIndex>().Scan(*state.index_state, state.row_ids);
+		if (row_count == 0) {
+			return false;
+		}
+		auto row_group_size = storage.GetRowGroupSize();
+		if (row_group_size == 0) {
+			row_group_size = 1;
+		}
+		BuildRowGroupBatches(state, row_group_size, row_count);
+		return !state.batches.empty();
+	};
+
+	auto &target_chunk = state.projection_ids.empty() ? output : state.all_columns;
+	target_chunk.Reset();
+	idx_t produced = 0;
+
+	while (produced == 0) {
+		if (!ensure_batches()) {
+			if (state.projection_ids.empty()) {
+				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
+			} else {
+				state.all_columns.Reset();
+				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+				output.ReferenceColumns(state.all_columns, state.projection_ids);
+			}
+			return;
+		}
+
+		while (state.next_batch < state.batches.size() && produced < STANDARD_VECTOR_SIZE) {
+			auto &batch = state.batches[state.next_batch];
+			produced = ConsumeBatch(storage, transaction, state.column_ids, batch, target_chunk, produced);
+			state.next_batch++;
+		}
 	}
 
-	// Fetch the data from the local storage given the row ids
-	if (state.projection_ids.empty()) {
-		// Directly fetch columns into output
-		bind_data.table.GetStorage().Fetch(transaction, output, state.column_ids,
-		                                   state.row_ids, row_count, state.fetch_state);
-		return;
+	target_chunk.SetCardinality(produced);
+	if (!state.projection_ids.empty()) {
+		output.ReferenceColumns(target_chunk, state.projection_ids);
 	}
-
-	// Otherwise, we need to first fetch into our scan chunk, and then project out the result
-	state.all_columns.Reset();
-	bind_data.table.GetStorage().Fetch(transaction, state.all_columns, state.column_ids,
-	                                   state.row_ids, row_count, state.fetch_state);
-
-	output.ReferenceColumns(state.all_columns, state.projection_ids);
 }
 
 //-------------------------------------------------------------------------

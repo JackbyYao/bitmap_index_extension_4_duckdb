@@ -39,6 +39,14 @@ PhysicalCreateBitmapIndex::PhysicalCreateBitmapIndex(PhysicalPlan &physical_plan
 }
 
 //-------------------------------------------------------------
+// Local State (for parallel execution)
+//-------------------------------------------------------------
+class CreateBitmapIndexLocalSinkState final : public LocalSinkState {
+public:
+	unique_ptr<BitmapIndex> local_index;
+};
+
+//-------------------------------------------------------------
 // Global State
 //-------------------------------------------------------------
 class CreateBitmapIndexGlobalState final : public GlobalSinkState {
@@ -48,8 +56,6 @@ public:
 	AllocatedData slice_buffer;
 
 	idx_t entry_idx;
-
-
 };
 
 unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(ClientContext &context) const {
@@ -78,22 +84,31 @@ unique_ptr<GlobalSinkState> PhysicalCreateBitmapIndex::GetGlobalSinkState(Client
 }
 
 //-------------------------------------------------------------
+// Local Sink State
+//-------------------------------------------------------------
+unique_ptr<LocalSinkState> PhysicalCreateBitmapIndex::GetLocalSinkState(ExecutionContext &context) const {
+	return make_uniq<CreateBitmapIndexLocalSinkState>();
+}
+
+static unique_ptr<BitmapIndex> CreateLocalBitmapIndex(const PhysicalCreateBitmapIndex &op,
+                                                      BitmapIndex &global_index) {
+	auto &storage = op.table.GetStorage();
+	return make_uniq<BitmapIndex>(op.info->index_name, op.info->constraint_type, op.storage_ids,
+	                              TableIOManager::Get(storage), op.unbound_expressions, storage.db, op.info->options,
+	                              IndexStorageInfo(), op.estimated_cardinality, global_index.GetDictionary());
+}
+
+//-------------------------------------------------------------
 // Sink
 //-------------------------------------------------------------
 SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<CreateBitmapIndexGlobalState>();
-	auto &bitmap_index = *gstate.bitmap_ptr;
-
-	// DUMMY: 假装插入数据到索引
-	// 实际实现：
-	// 1. 从chunk中提取索引列数据
-	// 2. 生成row_ids向量
-	// 3. 调用bitmap_index.Append()
-
-	// 在索引创建期间，索引还未被其他线程访问，需要手动加锁
-	IndexLock lock;
-	bitmap_index.InitializeLock(lock);
+	auto &lstate = input.local_state.Cast<CreateBitmapIndexLocalSinkState>();
+	if (!lstate.local_index) {
+		lstate.local_index = CreateLocalBitmapIndex(*this, *gstate.bitmap_ptr);
+	}
+	auto &bitmap_index = *lstate.local_index;
 
 	D_ASSERT(chunk.ColumnCount() >= 1);
 
@@ -120,10 +135,34 @@ SinkResultType PhysicalCreateBitmapIndex::Sink(ExecutionContext &context, DataCh
 
 	auto &rowid_vector = chunk.data[rowid_col_idx];
 
+	IndexLock lock;
+	bitmap_index.InitializeLock(lock);
 	bitmap_index.Append(lock, key_chunk, rowid_vector);
-	gstate.entry_idx += chunk.size();
 
 	return SinkResultType::NEED_MORE_INPUT;
+}
+
+//-------------------------------------------------------------
+// Combine (merge local indexes into global index)
+//-------------------------------------------------------------
+SinkCombineResultType PhysicalCreateBitmapIndex::Combine(ExecutionContext &context,
+                                                         OperatorSinkCombineInput &input) const {
+	auto &g_state = input.global_state.Cast<CreateBitmapIndexGlobalState>();
+	auto &l_state = input.local_state.Cast<CreateBitmapIndexLocalSinkState>();
+
+	if (!l_state.local_index) {
+		return SinkCombineResultType::FINISHED;
+	}
+
+	auto &global_bitmap_table = g_state.bitmap_ptr->bitmap_table;
+	auto &local_bitmap_table = l_state.local_index->bitmap_table;
+
+	if (!global_bitmap_table || !local_bitmap_table) {
+		return SinkCombineResultType::FINISHED;
+	}
+
+	global_bitmap_table->MergeFrom(*local_bitmap_table);
+	return SinkCombineResultType::FINISHED;
 }
 
 //-------------------------------------------------------------
