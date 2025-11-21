@@ -88,21 +88,37 @@ static void BuildRowGroupBatches(BitmapIndexScanGlobalState &state, idx_t row_gr
 static void GatherRows(RowGroup &row_group, TransactionData &transaction_data, const vector<StorageIndex> &column_ids,
                        const SelectionVector &sel, idx_t valid_count, idx_t local_vector_index, DataChunk &result,
                        idx_t offset) {
+	// Boundary check: ensure we don't write beyond STANDARD_VECTOR_SIZE
+	D_ASSERT(offset + valid_count <= STANDARD_VECTOR_SIZE);
+	if (offset + valid_count > STANDARD_VECTOR_SIZE) {
+		return;
+	}
+	
+	// Safety check: ensure result.data is initialized and has enough columns
+	if (result.data.empty() || result.ColumnCount() < column_ids.size()) {
+		return;
+	}
+	
 	for (idx_t col_idx = 0; col_idx < column_ids.size(); col_idx++) {
 		auto &column = column_ids[col_idx];
 		auto &result_vector = result.data[col_idx];
+		// Ensure the vector is flat and has enough capacity
+		result_vector.Flatten(STANDARD_VECTOR_SIZE);
+		D_ASSERT(result_vector.GetVectorType() == VectorType::FLAT_VECTOR);
 		auto &col_data = row_group.GetColumnRef(column);
 
 		ColumnScanState scan_state;
 		scan_state.Initialize(col_data.type, column.GetChildIndexes(), nullptr);
 		auto vector_start = row_group.start + local_vector_index * STANDARD_VECTOR_SIZE;
+		col_data.InitializeScan(scan_state);
 		col_data.InitializeScanWithOffset(scan_state, vector_start);
 
 		Vector temp(col_data.type);
 		auto global_vector_index = vector_start / STANDARD_VECTOR_SIZE;
 		col_data.Scan(transaction_data, global_vector_index, scan_state, temp);
-		temp.Slice(sel, valid_count);
-		VectorOperations::Copy(temp, result_vector, valid_count, 0, offset);
+		// Copy directly using the selection vector - temp contains the full vector,
+		// and sel contains the indices we want to copy
+		VectorOperations::Copy(temp, result_vector, sel, valid_count, 0, offset, valid_count);
 	}
 }
 
@@ -147,6 +163,12 @@ static idx_t ConsumeBatch(DataTable &storage, DuckTransaction &transaction, cons
 			continue;
 		}
 
+		// Ensure we don't exceed STANDARD_VECTOR_SIZE before calling GatherRows
+		D_ASSERT(offset + valid_count <= STANDARD_VECTOR_SIZE);
+		if (offset + valid_count > STANDARD_VECTOR_SIZE) {
+			break;
+		}
+
 		GatherRows(*row_group, transaction_data, column_ids, sel, valid_count, local_vector_index, result, offset);
 		offset += valid_count;
 	}
@@ -180,16 +202,15 @@ static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientCont
 	// Initialize the scan state for the index
 	//result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan();
 	result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan(&bind_data.filter_value);
-	// Early out if there is nothing to project
-	if (!input.CanRemoveFilterColumns()) {
-		return std::move(result);
-	}
+	
 	// We need this to project out what we scan from the underlying table.
 	result->projection_ids = input.projection_ids;
 
 	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 	const auto &columns = duck_table.GetColumns();
 
+	// Always initialize all_columns since we use it in BitmapIndexScanExecute
+	// even when CanRemoveFilterColumns() returns false
 	vector<LogicalType> scanned_types;
 	for (const auto &col_idx : input.column_indexes) {
 		if (col_idx.IsRowIdColumn()) {
@@ -231,32 +252,74 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 		return !state.batches.empty();
 	};
 
-	auto &target_chunk = state.projection_ids.empty() ? output : state.all_columns;
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+	
+	auto &target_chunk = state.all_columns;
 	target_chunk.Reset();
 	idx_t produced = 0;
-
-	while (produced == 0) {
+	
+	// Try to get data from batches (similar to DuckIndexScanState::TableScanFunc)
+	while (produced < STANDARD_VECTOR_SIZE) {
 		if (!ensure_batches()) {
-			if (state.projection_ids.empty()) {
-				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
-			} else {
-				state.all_columns.Reset();
-				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
-				output.ReferenceColumns(state.all_columns, state.projection_ids);
-			}
-			return;
+			// No more batches from index, break to try local_storage
+			break;
 		}
-
+		
 		while (state.next_batch < state.batches.size() && produced < STANDARD_VECTOR_SIZE) {
 			auto &batch = state.batches[state.next_batch];
 			produced = ConsumeBatch(storage, transaction, state.column_ids, batch, target_chunk, produced);
 			state.next_batch++;
 		}
 	}
-
+	
 	target_chunk.SetCardinality(produced);
-	if (!state.projection_ids.empty()) {
-		output.ReferenceColumns(target_chunk, state.projection_ids);
+	
+	// Process data from batches if we got any
+	if (produced > 0) {
+		if (state.projection_ids.empty()) {
+			output.Move(target_chunk);
+		} else {
+			// Ensure output is initialized with correct column count
+			if (output.ColumnCount() != state.projection_ids.size()) {
+				vector<LogicalType> output_types;
+				output_types.reserve(state.projection_ids.size());
+				for (auto &proj_id : state.projection_ids) {
+					if (proj_id >= target_chunk.ColumnCount()) {
+						throw InternalException("Projection index %llu out of range (column count: %llu)", 
+						                        proj_id, target_chunk.ColumnCount());
+					}
+					output_types.push_back(target_chunk.data[proj_id].GetType());
+				}
+				output.Initialize(context, output_types);
+			}
+			output.ReferenceColumns(target_chunk, state.projection_ids);
+		}
+	}
+	
+	// If no data from batches, try local_storage (following DuckIndexScanState::TableScanFunc pattern)
+	if (output.size() == 0) {
+		state.all_columns.Reset();
+		if (state.projection_ids.empty()) {
+			local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
+		} else {
+			local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+			// Ensure output is initialized with correct column count
+			if (output.ColumnCount() != state.projection_ids.size()) {
+				vector<LogicalType> output_types;
+				output_types.reserve(state.projection_ids.size());
+				for (auto &proj_id : state.projection_ids) {
+					if (proj_id >= state.all_columns.ColumnCount()) {
+						throw InternalException("Projection index %llu out of range (column count: %llu)", 
+						                        proj_id, state.all_columns.ColumnCount());
+					}
+					output_types.push_back(state.all_columns.data[proj_id].GetType());
+				}
+				output.Initialize(context, output_types);
+			}
+			output.ReferenceColumns(state.all_columns, state.projection_ids);
+		}
 	}
 }
 

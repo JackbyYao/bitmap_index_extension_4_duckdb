@@ -1,7 +1,7 @@
 [submodule "duckdb"]
 	path = duckdb
-	url = https://github.com/duckdb/duckdb
-	branch = main
+  url = https://github.com/JackbyYao/duckdb.git
+  branch = main
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
