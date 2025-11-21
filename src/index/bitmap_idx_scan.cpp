@@ -88,21 +88,37 @@ static void BuildRowGroupBatches(BitmapIndexScanGlobalState &state, idx_t row_gr
 static void GatherRows(RowGroup &row_group, TransactionData &transaction_data, const vector<StorageIndex> &column_ids,
                        const SelectionVector &sel, idx_t valid_count, idx_t local_vector_index, DataChunk &result,
                        idx_t offset) {
+	// Boundary check: ensure we don't write beyond STANDARD_VECTOR_SIZE
+	D_ASSERT(offset + valid_count <= STANDARD_VECTOR_SIZE);
+	if (offset + valid_count > STANDARD_VECTOR_SIZE) {
+		return;
+	}
+	
+	// Safety check: ensure result.data is initialized and has enough columns
+	if (result.data.empty() || result.ColumnCount() < column_ids.size()) {
+		return;
+	}
+	
 	for (idx_t col_idx = 0; col_idx < column_ids.size(); col_idx++) {
 		auto &column = column_ids[col_idx];
 		auto &result_vector = result.data[col_idx];
+		// Ensure the vector is flat and has enough capacity
+		result_vector.Flatten(STANDARD_VECTOR_SIZE);
+		D_ASSERT(result_vector.GetVectorType() == VectorType::FLAT_VECTOR);
 		auto &col_data = row_group.GetColumnRef(column);
 
 		ColumnScanState scan_state;
 		scan_state.Initialize(col_data.type, column.GetChildIndexes(), nullptr);
 		auto vector_start = row_group.start + local_vector_index * STANDARD_VECTOR_SIZE;
+		col_data.InitializeScan(scan_state);
 		col_data.InitializeScanWithOffset(scan_state, vector_start);
 
 		Vector temp(col_data.type);
 		auto global_vector_index = vector_start / STANDARD_VECTOR_SIZE;
 		col_data.Scan(transaction_data, global_vector_index, scan_state, temp);
-		temp.Slice(sel, valid_count);
-		VectorOperations::Copy(temp, result_vector, valid_count, 0, offset);
+		// Copy directly using the selection vector - temp contains the full vector,
+		// and sel contains the indices we want to copy
+		VectorOperations::Copy(temp, result_vector, sel, valid_count, 0, offset, valid_count);
 	}
 }
 
@@ -147,6 +163,12 @@ static idx_t ConsumeBatch(DataTable &storage, DuckTransaction &transaction, cons
 			continue;
 		}
 
+		// Ensure we don't exceed STANDARD_VECTOR_SIZE before calling GatherRows
+		D_ASSERT(offset + valid_count <= STANDARD_VECTOR_SIZE);
+		if (offset + valid_count > STANDARD_VECTOR_SIZE) {
+			break;
+		}
+
 		GatherRows(*row_group, transaction_data, column_ids, sel, valid_count, local_vector_index, result, offset);
 		offset += valid_count;
 	}
@@ -180,16 +202,15 @@ static unique_ptr<GlobalTableFunctionState> BitmapIndexScanInitGlobal(ClientCont
 	// Initialize the scan state for the index
 	//result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan();
 	result->index_state = bind_data.index.Cast<BitmapIndex>().InitializeScan(&bind_data.filter_value);
-	// Early out if there is nothing to project
-	if (!input.CanRemoveFilterColumns()) {
-		return std::move(result);
-	}
+	
 	// We need this to project out what we scan from the underlying table.
 	result->projection_ids = input.projection_ids;
 
 	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 	const auto &columns = duck_table.GetColumns();
 
+	// Always initialize all_columns since we use it in BitmapIndexScanExecute
+	// even when CanRemoveFilterColumns() returns false
 	vector<LogicalType> scanned_types;
 	for (const auto &col_idx : input.column_indexes) {
 		if (col_idx.IsRowIdColumn()) {
@@ -231,11 +252,11 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 		return !state.batches.empty();
 	};
 
-	auto &target_chunk = state.projection_ids.empty() ? output : state.all_columns;
+	auto &target_chunk = state.all_columns;
 	target_chunk.Reset();
 	idx_t produced = 0;
 
-	while (produced == 0) {
+	while (produced < STANDARD_VECTOR_SIZE) {
 		if (!ensure_batches()) {
 			if (state.projection_ids.empty()) {
 				local_storage.Scan(state.local_storage_state.local_state, state.column_ids, output);
@@ -255,8 +276,49 @@ static void BitmapIndexScanExecute(ClientContext &context, TableFunctionInput &d
 	}
 
 	target_chunk.SetCardinality(produced);
-	if (!state.projection_ids.empty()) {
-		output.ReferenceColumns(target_chunk, state.projection_ids);
+	
+	// If no data produced, scan from local storage
+	if (produced == 0) {
+		state.all_columns.Reset();
+		local_storage.Scan(state.local_storage_state.local_state, state.column_ids, state.all_columns);
+		produced = state.all_columns.size();
+	}
+	
+	// Handle output based on whether we need projection
+	if (state.projection_ids.empty()) {
+		// No projection needed, directly move the data
+		if (produced > 0) {
+			output.Move(target_chunk);
+		} else {
+			output.Move(state.all_columns);
+		}
+	} else {
+		// Projection needed, use ReferenceColumns (output should be initialized by executor)
+		// Use target_chunk if we have data, otherwise use all_columns
+		DataChunk &source_chunk = (produced > 0) ? target_chunk : state.all_columns;
+		
+		// Ensure output is initialized with correct column count
+		if (output.ColumnCount() != state.projection_ids.size()) {
+			vector<LogicalType> output_types;
+			output_types.reserve(state.projection_ids.size());
+			for (auto &proj_id : state.projection_ids) {
+				// Get the type from source_chunk
+				if (proj_id >= source_chunk.ColumnCount()) {
+					throw InternalException("Projection index %llu out of range (column count: %llu)", 
+					                        proj_id, source_chunk.ColumnCount());
+				}
+				output_types.push_back(source_chunk.data[proj_id].GetType());
+			}
+			output.Initialize(context, output_types);
+		}
+		
+		// Verify source_chunk has enough columns
+		if (source_chunk.ColumnCount() == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+		
+		output.ReferenceColumns(source_chunk, state.projection_ids);
 	}
 }
 
