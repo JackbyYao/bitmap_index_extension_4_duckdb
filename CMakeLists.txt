@@ -25,11 +25,19 @@ if(DEFINED VCPKG_BUILD AND VCPKG_BUILD AND DEFINED CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 
+# rdynamic is not available on macOS
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -rdynamic")
+endif()
+
 find_package(OpenSSL REQUIRED)
 find_package(roaring CONFIG REQUIRED)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 project(${TARGET_NAME})
 add_subdirectory(src)
