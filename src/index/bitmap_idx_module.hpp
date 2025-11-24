@@ -9,6 +9,7 @@ struct BitmapIndexModule {
 	static void RegisterIndexScan(ExtensionLoader &loader);
 	static void RegisterIndexPlanScan(ExtensionLoader &loader);
 	static void RegisterIndexPragmas(ExtensionLoader &loader);
+	static void RegisterBitmapIndexJoin(ExtensionLoader &loader);
 };
 
 } // namespace duckdb
