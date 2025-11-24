@@ -35,6 +35,8 @@ public:
 	JoinProjectionColumns lhs_output_columns;
 	//! The indices/types of the rhs columns that need to be output
 	JoinProjectionColumns rhs_output_columns;
+	//! Table column indices for the build side when fetching from storage
+	vector<idx_t> build_table_col_indices;
 
 	//! Bitmap index reference
 	BitmapIndex *bitmap_index;
@@ -102,6 +104,8 @@ struct PhysicalBitmapIndexJoin::BitmapIndexJoinOperatorState : public CachingOpe
 	DataChunk lhs_output;
 	// Buffer for right side output (gathered from bitmap index)
 	DataChunk rhs_output;
+	// Buffer for casting join keys to logical type
+	unique_ptr<Vector> cast_key_vector;
 	// Row IDs from bitmap index lookup, grouped by left row index
 	// Each entry is (left_row_index, vector<row_t>)
 	vector<pair<idx_t, vector<row_t>>> row_id_matches;

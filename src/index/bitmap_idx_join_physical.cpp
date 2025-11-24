@@ -3,6 +3,8 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -16,6 +18,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include <unordered_set>
 #include <algorithm>
@@ -52,56 +55,94 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
 		}
 	}
 
-	auto &lhs_input_types = children[0].get().GetTypes();
-	auto &rhs_input_types = children[1].get().GetTypes();
-
-	// Create projection maps for LHS - same as PhysicalHashJoin
+	// Use types from this->types which were already resolved by the logical operator
+	// The logical operator applied MapTypes with projection maps, so these are the correct output types
+	// For non-SEMI/ANTI/MARK joins: this->types = [left_types..., right_types...]
+	// For SEMI/ANTI/MARK joins: this->types = [left_types...] (or [left_types..., BOOLEAN] for MARK)
+	
+	// Calculate left output type count
+	idx_t left_output_type_count = 0;
+	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
+		// Only left side is output
+		left_output_type_count = this->types.size();
+		if (join_type == JoinType::MARK) {
+			// MARK join has one extra BOOLEAN column at the end
+			left_output_type_count--;
+		}
+	} else {
+		// Both sides are output
+		// Determine left side count from projection maps
+		if (!left_projection_map.empty()) {
+			left_output_type_count = left_projection_map.size();
+		} else if (!right_projection_map.empty()) {
+			// Infer from right projection map and total types
+			left_output_type_count = this->types.size() - right_projection_map.size();
+		} else {
+			// Both projection maps are empty - need to determine from children
+			// Use the logical left child's type count
+			// Since we don't have direct access to logical children, we use the physical children
+			// The logical left child corresponds to children[0] in the physical plan
+			// (regardless of which side is probe/build)
+			left_output_type_count = children[0].get().GetTypes().size();
+		}
+	}
+	
+	// Extract left and right types from this->types
+	vector<LogicalType> left_output_types;
+	vector<LogicalType> right_output_types;
+	
+	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
+		// Only left side
+		left_output_types = this->types;
+		if (join_type == JoinType::MARK) {
+			// Remove the MARK column (last one)
+			left_output_types.pop_back();
+		}
+	} else {
+		// Both sides - split this->types into left and right portions
+		D_ASSERT(left_output_type_count <= this->types.size());
+		left_output_types.assign(this->types.begin(), this->types.begin() + left_output_type_count);
+		right_output_types.assign(this->types.begin() + left_output_type_count, this->types.end());
+	}
+	
+	// Create projection maps for left side (logical left child)
 	lhs_output_columns.col_idxs = left_projection_map;
 	if (lhs_output_columns.col_idxs.empty()) {
-		lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
-		for (idx_t i = 0; i < lhs_input_types.size(); i++) {
+		// No projection map - use all columns
+		lhs_output_columns.col_idxs.reserve(left_output_types.size());
+		for (idx_t i = 0; i < left_output_types.size(); i++) {
 			lhs_output_columns.col_idxs.emplace_back(i);
 		}
 	}
-	for (auto &lhs_col : lhs_output_columns.col_idxs) {
-		lhs_output_columns.col_types.push_back(lhs_input_types[lhs_col]);
-	}
+	// Use the resolved types from logical operator (already applied projection map)
+	lhs_output_columns.col_types = left_output_types;
 
 	// For ANTI, SEMI and MARK join, we only need keys, so payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
 		return;
 	}
 
-	// Create projection maps for RHS
-	// If we have mapped table column indices and bitmap index is on right table, use them for data fetching
-	if (!right_table_col_indices.empty() && bitmap_index_table_index == 1) {
-		// Use mapped table column indices for fetching from table
-		rhs_output_columns.col_idxs = right_table_col_indices;
-		// Types should come from child operator, not table columns
-		// Use right_projection_map to map from rhs_input_types
-		// Note: right_projection_map should already be set by ColumnLifetimeAnalyzer in optimize_function stage
-		for (auto &rhs_col : right_projection_map) {
-			if (rhs_col < rhs_input_types.size()) {
-				rhs_output_columns.col_types.push_back(rhs_input_types[rhs_col]);
-				payload_columns.col_idxs.push_back(rhs_col);
-				payload_columns.col_types.push_back(rhs_input_types[rhs_col]);
-			}
+	// Create projection maps for right side
+	auto right_projection_map_copy = right_projection_map;
+	if (right_projection_map_copy.empty()) {
+		// No projection map - use all columns
+		right_projection_map_copy.reserve(right_output_types.size());
+		for (idx_t i = 0; i < right_output_types.size(); i++) {
+			right_projection_map_copy.emplace_back(i);
 		}
+	}
+	// Use the resolved types from logical operator (already applied projection map)
+	for (idx_t i = 0; i < right_projection_map_copy.size(); i++) {
+		rhs_output_columns.col_idxs.push_back(right_projection_map_copy[i]);
+		rhs_output_columns.col_types.push_back(right_output_types[i]);
+		payload_columns.col_idxs.push_back(right_projection_map_copy[i]);
+		payload_columns.col_types.push_back(right_output_types[i]);
+	}
+
+	if (bitmap_index_table_index == 0) {
+		build_table_col_indices = lhs_output_columns.col_idxs;
 	} else {
-		// Use child output column indices and types (same as PhysicalHashJoin)
-		auto right_projection_map_copy = right_projection_map;
-		if (right_projection_map_copy.empty()) {
-			right_projection_map_copy.reserve(rhs_input_types.size());
-			for (idx_t i = 0; i < rhs_input_types.size(); i++) {
-				right_projection_map_copy.emplace_back(i);
-			}
-		}
-		for (auto &rhs_col : right_projection_map_copy) {
-			rhs_output_columns.col_idxs.push_back(rhs_col);
-			rhs_output_columns.col_types.push_back(rhs_input_types[rhs_col]);
-			payload_columns.col_idxs.push_back(rhs_col);
-			payload_columns.col_types.push_back(rhs_input_types[rhs_col]);
-		}
+		build_table_col_indices = right_table_col_indices.empty() ? rhs_output_columns.col_idxs : right_table_col_indices;
 	}
 }
 
@@ -164,11 +205,13 @@ void PhysicalBitmapIndexJoin::BuildPipelines(Pipeline &current, MetaPipeline &me
 	auto &state = meta_pipeline.GetState();
 	state.AddPipelineOperator(current, *this);
 	
-	// Continue building the current pipeline on the LHS (probe side)
-	children[0].get().BuildPipelines(current, meta_pipeline);
+	// Continue building the current pipeline on the probe side
+	// Probe side is determined by probe_side_is_left, not always children[0]
+	auto &probe_child = probe_side_is_left ? children[0] : children[1];
+	probe_child.get().BuildPipelines(current, meta_pipeline);
 	
 	// No need to create child pipeline since we're a regular operator (not a source)
-	// The right side (build side) is handled by PhysicalBitmapIndexLookup which is a virtual operator
+	// The build side is handled by PhysicalBitmapIndexLookup which is a virtual operator
 }
 
 
@@ -194,7 +237,13 @@ OperatorResultType PhysicalBitmapIndexJoin::ExecuteInternal(ExecutionContext &co
 	state.probe_executor.Execute(input, state.join_keys);
 
 	// Store left side output for later
-	state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
+	if (probe_side_is_left) {
+		state.lhs_output.ReferenceColumns(input, lhs_output_columns.col_idxs);
+		state.lhs_output.SetCardinality(input.size());
+	} else {
+		state.rhs_output.ReferenceColumns(input, rhs_output_columns.col_idxs);
+		state.rhs_output.SetCardinality(input.size());
+	}
 
 	// Initialize match tracking for this input chunk
 	state.left_row_matched.assign(input.size(), false);
@@ -202,38 +251,107 @@ OperatorResultType PhysicalBitmapIndexJoin::ExecuteInternal(ExecutionContext &co
 	state.match_pos = 0;
 	state.row_id_pos = 0;
 
+	// Get the key value(s) - for now, handle single key case
+	if (state.join_keys.ColumnCount() == 0) {
+		chunk.SetCardinality(0);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	// Use UnifiedVectorFormat to safely handle all Vector types (FLAT, DICTIONARY, CONSTANT, etc.)
+	// This is critical for release mode where D_ASSERT is disabled and FlatVector::IsNull() may fail
+	// on non-FLAT vectors. Reference: null_operations.cpp uses ToUnifiedFormat for safe access.
+	auto &key_vector = state.join_keys.data[0];
+	const LogicalType *target_key_type = condition_types.empty() ? nullptr : &condition_types[0];
+	if (target_key_type && key_vector.GetType() != *target_key_type) {
+		if (!state.cast_key_vector || state.cast_key_vector->GetType() != *target_key_type) {
+			state.cast_key_vector = make_uniq<Vector>(*target_key_type);
+		}
+		VectorOperations::Cast(context.client, key_vector, *state.cast_key_vector, state.join_keys.size());
+		key_vector.Reference(*state.cast_key_vector);
+	}
+
+	UnifiedVectorFormat key_data;
+	key_vector.ToUnifiedFormat(state.join_keys.size(), key_data);
+
 	// For each row in the input chunk, lookup bitmap index
 	for (idx_t row = 0; row < state.join_keys.size(); row++) {
-		// Get the key value(s) - for now, handle single key case
-		if (state.join_keys.ColumnCount() == 0) {
-			continue;
-		}
+		// Get the actual index using selection vector (handles DICTIONARY_VECTOR correctly)
+		auto key_idx = key_data.sel->get_index(row);
 
 		// Check for NULL - NULL keys don't match in equality joins
-		if (FlatVector::IsNull(state.join_keys.data[0], row)) {
+		// Use UnifiedVectorFormat's validity mask (works for all vector types)
+		if (!key_data.validity.RowIsValid(key_idx)) {
 			continue;
 		}
 
-		// Get the key value
-		Value key_value = state.join_keys.data[0].GetValue(row);
+		// Materialize the key value for type inspection/conversion
+		Value key_value = key_vector.GetValue(key_idx);
+		auto key_value_type = key_value.type();
+		auto key_value_type_id = key_value_type.id();
+		auto expected_type_id = target_key_type ? target_key_type->id() : key_value_type_id;
 
-		// Convert to dictionary ID if VARCHAR
+		// Convert to dictionary ID
 		int dict_id = -1;
-		if (key_value.type().id() == LogicalTypeId::VARCHAR) {
-			dict_id = bitmap_index->LookupValueId(key_value.GetValue<string>());
-		} else {
-			// For numeric types, try to convert to int
-			try {
-				dict_id = key_value.GetValue<int>();
-			} catch (...) {
-				// Skip if conversion fails
+		
+		switch (expected_type_id) {
+		case LogicalTypeId::VARCHAR:
+		case LogicalTypeId::CHAR: {
+			auto string_value = key_value_type_id == LogicalTypeId::VARCHAR || key_value_type_id == LogicalTypeId::CHAR
+			                        ? key_value
+			                        : key_value.DefaultCastAs(LogicalType::VARCHAR);
+			string str_value = string_value.GetValue<string>();
+			dict_id = bitmap_index->LookupValueId(str_value);
+			break;
+		}
+		case LogicalTypeId::ENUM: {
+			string str_value;
+			if (key_value_type_id == LogicalTypeId::ENUM) {
+				str_value = EnumType::GetValue(key_value);
+			} else {
+				auto string_value = key_value.DefaultCastAs(LogicalType::VARCHAR);
+				str_value = string_value.GetValue<string>();
+			}
+			dict_id = bitmap_index->LookupValueId(str_value);
+			break;
+		}
+		case LogicalTypeId::BOOLEAN:
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT: {
+			auto numeric_value = key_value_type_id == expected_type_id
+			                         ? key_value
+			                         : key_value.DefaultCastAs(LogicalType::BIGINT);
+			int64_t sv = numeric_value.GetValue<int64_t>();
+			if (sv < NumericLimits<int32_t>::Minimum() || sv > NumericLimits<int32_t>::Maximum()) {
 				continue;
 			}
+			dict_id = static_cast<int32_t>(sv);
+			break;
+		}
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::UBIGINT: {
+			auto numeric_value = key_value_type_id == expected_type_id
+			                         ? key_value
+			                         : key_value.DefaultCastAs(LogicalType::UBIGINT);
+			uint64_t uv = numeric_value.GetValue<uint64_t>();
+			if (uv > static_cast<uint64_t>(NumericLimits<int32_t>::Maximum())) {
+				continue;
+			}
+			dict_id = static_cast<int32_t>(uv);
+			break;
+		}
+		default:
+			throw InvalidInputException("Bitmap index join does not support probe key type \"%s\"",
+			                            target_key_type ? target_key_type->ToString() : key_value_type.ToString());
 		}
 
 		if (dict_id < 0) {
-			// Key not found in index
-			continue;
+			throw InvalidInputException("Bitmap index \"%s\" does not contain value %s",
+			                            bitmap_index ? bitmap_index->name : "UNKNOWN",
+			                            key_value.ToString());
 		}
 
 		// Get row IDs for this key value
@@ -298,29 +416,34 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 	auto &tx = DuckTransaction::Get(context.client, bitmap_index_table->catalog);
 	auto &storage = bitmap_index_table->GetStorage();
 
-	// Fetch right table columns
-	if (!rhs_output_columns.col_idxs.empty() && bitmap_index_table_index == 1) {
+	// Determine build/probe chunks
+	bool build_is_left = bitmap_index_table_index == 0;
+	auto &build_chunk = build_is_left ? state.lhs_output : state.rhs_output;
+	auto &build_columns = build_is_left ? lhs_output_columns : rhs_output_columns;
+
+	// Fetch build side columns from table when required
+	if (!build_columns.col_idxs.empty()) {
 		// Convert table column indices to storage indices
 		vector<StorageIndex> storage_indices;
 		auto &columns = bitmap_index_table->GetColumns();
-		for (auto table_col_idx : rhs_output_columns.col_idxs) {
+		const auto &table_col_indices =
+		    build_table_col_indices.empty() ? build_columns.col_idxs : build_table_col_indices;
+		for (auto table_col_idx : table_col_indices) {
 			if (table_col_idx < columns.LogicalColumnCount()) {
 				auto physical_idx = columns.LogicalToPhysical(LogicalIndex(table_col_idx));
 				storage_indices.push_back(StorageIndex(physical_idx.index));
 			}
 		}
 		if (!storage_indices.empty()) {
-			// Ensure rhs_output 的向量类型正确（Fetch 要求 FLAT_VECTOR）
-			state.rhs_output.Reset();
-			for (idx_t i = 0; i < state.rhs_output.ColumnCount(); i++) {
-				state.rhs_output.data[i].SetVectorType(VectorType::FLAT_VECTOR);
+			build_chunk.Reset();
+			for (idx_t i = 0; i < build_chunk.ColumnCount(); i++) {
+				build_chunk.data[i].SetVectorType(VectorType::FLAT_VECTOR);
 			}
-			
-			storage.Fetch(tx, state.rhs_output, storage_indices, row_id_vector, fetch_count,
-			             state.fetch_state);
+
+			storage.Fetch(tx, build_chunk, storage_indices, row_id_vector, fetch_count, state.fetch_state);
 			// Fetch 已经设置了正确的 cardinality（实际 fetch 到的行数）
 			// 绝对不要覆盖它！使用 Fetch 返回的实际行数
-			idx_t actual_fetched_count = state.rhs_output.size();
+			idx_t actual_fetched_count = build_chunk.size();
 			
 			if (actual_fetched_count == 0) {
 				// 没有 fetch 到任何数据，跳过这些 row_ids，继续下一个
@@ -340,12 +463,12 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 			fetch_count = actual_fetched_count;
 		} else {
 			// 如果没有需要 fetch 的列，设置 cardinality 为 0
-			state.rhs_output.SetCardinality(0);
+			build_chunk.SetCardinality(0);
 			fetch_count = 0;
 		}
 	} else {
-		// 如果不需要 fetch right table 的列，设置 cardinality 为 0
-		state.rhs_output.SetCardinality(0);
+		// 如果不需要 fetch build table 的列，设置 cardinality 为 0
+		build_chunk.SetCardinality(0);
 		fetch_count = 0;
 	}
 
@@ -377,11 +500,21 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 		chunk.data[i].SetVectorType(VectorType::FLAT_VECTOR);
 	}
 
-	// Copy left side columns - repeat left row for each match
+	// Copy left side columns
 	for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-		auto left_value = state.lhs_output.data[i].GetValue(left_row_idx);
-		for (idx_t j = 0; j < fetch_count; j++) {
-			chunk.data[i].SetValue(j, left_value);
+		auto &dst = chunk.data[i];
+		if (bitmap_index_table_index == 0) {
+			// Left is build side - copy fetched rows
+			VectorOperations::Copy(state.lhs_output.data[i], dst, fetch_count, 0, 0);
+		} else {
+			// Left is probe side - repeat left row for each match
+			auto &src = state.lhs_output.data[i];
+			SelectionVector sel(fetch_count);
+			for (idx_t j = 0; j < fetch_count; j++) {
+				sel.set_index(j, left_row_idx);
+			}
+			dst.Reference(src);
+			dst.Slice(sel, fetch_count);
 		}
 	}
 
@@ -389,8 +522,21 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 	// fetch_count 是实际 fetch 到的行数，直接使用
 	idx_t offset = lhs_output_columns.col_idxs.size();
 	for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-		chunk.data[offset + i].SetVectorType(VectorType::FLAT_VECTOR);
-		VectorOperations::Copy(state.rhs_output.data[i], chunk.data[offset + i], fetch_count, 0, 0);
+		auto &dst = chunk.data[offset + i];
+		dst.SetVectorType(VectorType::FLAT_VECTOR);
+		if (bitmap_index_table_index == 1) {
+			// Right side is build
+			VectorOperations::Copy(state.rhs_output.data[i], dst, fetch_count, 0, 0);
+		} else {
+			// Right side is probe - repeat probe row
+			auto &src = state.rhs_output.data[i];
+			SelectionVector sel(fetch_count);
+			for (idx_t j = 0; j < fetch_count; j++) {
+				sel.set_index(j, left_row_idx);
+			}
+			dst.Reference(src);
+			dst.Slice(sel, fetch_count);
+		}
 	}
 
 	state.row_id_pos += fetch_count;
