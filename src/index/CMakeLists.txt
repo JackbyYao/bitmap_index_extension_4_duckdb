@@ -7,5 +7,8 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_plan_scan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_scan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_pragmas.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_join_logical.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_join_physical.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/bitmap_idx_join_optimizer.cpp
         PARENT_SCOPE
 )

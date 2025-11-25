@@ -35,6 +35,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	BitmapIndexModule::RegisterIndexPragmas(loader); // pragma table functions
 	BitmapIndexModule::RegisterIndexScan(loader); // index scan table function
 	BitmapIndexModule::RegisterIndexPlanScan(loader); // optimizer hook
+	BitmapIndexModule::RegisterBitmapIndexJoin(loader); // bitmap index join optimizer
 	
 	
 	// Register a scalar function
