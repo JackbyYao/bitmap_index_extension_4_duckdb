@@ -168,18 +168,6 @@ static bool SubtreeHasInequalityExpressions(LogicalOperator &op) {
 	return false;
 }
 
-static bool PlanHasInequalityExpressions(LogicalOperator &op) {
-	if (OperatorHasInequalityExpressions(op)) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (PlanHasInequalityExpressions(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool HasUnsupportedTableFilters(LogicalOperator &op) {
 	auto logical_get = FindLogicalGet(&op);
 	if (!logical_get) {
@@ -402,28 +390,15 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		return;
 	}
 
+	if (OperatorHasInequalityExpressions(*plan)) {
+		return;
+	}
+
 	// Handle filters: try to optimize child first and attach build-side predicates to bitmap join
 	if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
 		auto &filter = plan->Cast<LogicalFilter>();
 		if (!filter.children.empty()) {
 			auto &child = filter.children[0];
-
-			bool block_child_optimization = false;
-				if (!filter.expressions.empty()) {
-					for (auto &expr : filter.expressions) {
-						if (ContainsInequality(*expr)) {
-							block_child_optimization = true;
-							break;
-						}
-					}
-				}
-
-			if (block_child_optimization) {
-				for (auto &grandchild : child->children) {
-					OptimizeRecursive(input, grandchild);
-				}
-				return;
-			}
 
 			OptimizeRecursive(input, child);
 
@@ -643,9 +618,6 @@ void BitmapIndexJoinOptimizer::DisableCompressedMaterializationIfNeeded(Optimize
 }
 
 void BitmapIndexJoinOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	if (plan && PlanHasInequalityExpressions(*plan)) {
-		return;
-	}
 	OptimizeRecursive(input, plan);
 }
 
