@@ -10,11 +10,20 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "index/bitmap_idx_scan.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 
 namespace duckdb {
 
@@ -124,6 +133,284 @@ static bool CollectTableColumnIndices(LogicalOperator &child, const vector<idx_t
     return true;
 }
 
+static void CollectFilterExpressions(LogicalOperator &op, vector<unique_ptr<Expression>> &filters) {
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op.Cast<LogicalFilter>();
+		for (auto &expr : filter.expressions) {
+			filters.push_back(expr->Copy());
+		}
+	}
+	for (auto &child : op.children) {
+		CollectFilterExpressions(*child, filters);
+	}
+}
+
+static bool CollectTableFilterExpressions(LogicalGet &logical_get, DuckTableEntry &duck_table,
+                                          vector<unique_ptr<Expression>> &filters) {
+	if (logical_get.table_filters.filters.empty()) {
+		return true;
+	}
+	auto &column_ids = logical_get.GetColumnIds();
+
+	for (auto &entry : logical_get.table_filters.filters) {
+		auto phys_column_id = entry.first;
+		idx_t local_idx = DConstants::INVALID_INDEX;
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i].GetPrimaryIndex() == phys_column_id) {
+				local_idx = i;
+				break;
+			}
+		}
+		if (local_idx == DConstants::INVALID_INDEX) {
+			return false;
+		}
+		idx_t bound_idx = local_idx;
+		if (!logical_get.projection_ids.empty()) {
+			idx_t found = DConstants::INVALID_INDEX;
+			for (idx_t pj = 0; pj < logical_get.projection_ids.size(); pj++) {
+				if (logical_get.projection_ids[pj] == local_idx) {
+					found = pj;
+					break;
+				}
+			}
+			if (found == DConstants::INVALID_INDEX) {
+				for (idx_t pj = 0; pj < logical_get.projection_ids.size(); pj++) {
+					auto proj_val = logical_get.projection_ids[pj];
+					if (proj_val != DConstants::INVALID_INDEX && proj_val < column_ids.size()) {
+						if (column_ids[proj_val].GetPrimaryIndex() == phys_column_id) {
+							found = pj;
+							break;
+						}
+					}
+				}
+			}
+			if (found == DConstants::INVALID_INDEX) {
+				return false;
+			}
+			bound_idx = found;
+		}
+		auto &column = duck_table.GetColumns().GetColumn(LogicalIndex(phys_column_id));
+		auto column_ref =
+		    make_uniq<BoundColumnRefExpression>(column.Type(), ColumnBinding(logical_get.table_index, bound_idx));
+		filters.push_back(entry.second->ToExpression(*column_ref));
+	}
+	return true;
+}
+
+static void CollectColumnBindings(Expression &expr, vector<ColumnBinding> &bindings) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &colref = expr.Cast<BoundColumnRefExpression>();
+		bindings.push_back(colref.binding);
+	}
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectColumnBindings(child, bindings); });
+}
+
+static bool TryMapBindingToTableColumn(LogicalOperator &child, LogicalGet &logical_get, const ColumnBinding &binding,
+                                       idx_t &table_col_idx) {
+	auto mapped_idx = TraceBindingToLogicalGet(child, binding, &logical_get);
+	if (mapped_idx == DConstants::INVALID_INDEX) {
+		return false;
+	}
+	auto &column_ids = logical_get.GetColumnIds();
+	if (mapped_idx >= column_ids.size()) {
+		return false;
+	}
+	auto column_id = column_ids[mapped_idx];
+	if (column_id.IsVirtualColumn()) {
+		return false;
+	}
+	table_col_idx = column_id.GetPrimaryIndex();
+	return true;
+}
+
+static unique_ptr<Expression>
+RemapFilterExpression(Expression &expr, LogicalOperator &child, LogicalGet &logical_get,
+                      const unordered_map<idx_t, idx_t> &column_pos_map, const vector<LogicalType> &chunk_types) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &colref = expr.Cast<BoundColumnRefExpression>();
+		idx_t table_col_idx;
+		if (!TryMapBindingToTableColumn(child, logical_get, colref.binding, table_col_idx)) {
+			throw InvalidInputException("Bitmap index join filter references unsupported column");
+		}
+		auto entry = column_pos_map.find(table_col_idx);
+		if (entry == column_pos_map.end()) {
+			throw InvalidInputException("Bitmap index join filter column was not prepared for bitmap lookup");
+		}
+		auto chunk_idx = entry->second;
+		D_ASSERT(chunk_idx < chunk_types.size());
+		return make_uniq<BoundReferenceExpression>(chunk_types[chunk_idx], chunk_idx);
+	}
+
+	auto copy = expr.Copy();
+	ExpressionIterator::EnumerateChildren(*copy,
+	                                      [&](unique_ptr<Expression> &child_expr) {
+		                                      child_expr = RemapFilterExpression(*child_expr, child, logical_get,
+		                                                                          column_pos_map, chunk_types);
+	                                      });
+	return copy;
+}
+
+struct BitmapBuildPlanInfo {
+	vector<idx_t> fetch_table_columns;
+	vector<LogicalType> fetch_column_types;
+	vector<idx_t> output_fetch_map;
+	unique_ptr<Expression> filter_expression;
+};
+
+static bool PrepareBuildSideInfo(LogicalOperator &child, const vector<idx_t> &projection_map,
+                                 DuckTableEntry &duck_table, BitmapBuildPlanInfo &info,
+                                 const vector<unique_ptr<Expression>> *additional_filters) {
+	auto logical_get = FindLogicalGetInSubtree(&child);
+	if (!logical_get) {
+		return false;
+	}
+
+	// Collect filter expressions inside the subtree (already pushed down)
+	vector<unique_ptr<Expression>> filter_expressions;
+	CollectFilterExpressions(child, filter_expressions);
+	if (!CollectTableFilterExpressions(*logical_get, duck_table, filter_expressions)) {
+		return false;
+	}
+	if (additional_filters) {
+		for (auto &expr : *additional_filters) {
+			filter_expressions.push_back(expr->Copy());
+		}
+	}
+
+	// Map projection columns to table columns
+	vector<ColumnBinding> child_bindings = child.GetColumnBindings();
+	vector<idx_t> projected_indices;
+	if (projection_map.empty()) {
+		for (idx_t i = 0; i < child_bindings.size(); i++) {
+			projected_indices.push_back(i);
+		}
+	} else {
+		projected_indices = projection_map;
+	}
+
+	vector<idx_t> output_table_cols;
+	output_table_cols.reserve(projected_indices.size());
+	for (auto proj_idx : projected_indices) {
+		if (proj_idx >= child_bindings.size()) {
+			return false;
+		}
+		idx_t table_col_idx;
+		if (!TryMapBindingToTableColumn(child, *logical_get, child_bindings[proj_idx], table_col_idx)) {
+			return false;
+		}
+		output_table_cols.push_back(table_col_idx);
+	}
+
+	// Collect all filter column ids
+	vector<ColumnBinding> filter_bindings;
+	for (auto &expr : filter_expressions) {
+		CollectColumnBindings(*expr, filter_bindings);
+	}
+	vector<idx_t> filter_table_cols;
+	filter_table_cols.reserve(filter_bindings.size());
+	for (auto &binding : filter_bindings) {
+		idx_t table_col_idx;
+		if (!TryMapBindingToTableColumn(child, *logical_get, binding, table_col_idx)) {
+			return false;
+		}
+		filter_table_cols.push_back(table_col_idx);
+	}
+
+	auto &columns = duck_table.GetColumns();
+
+	// Capture bitmap_index_scan filters (if present)
+	vector<pair<idx_t, Value>> bitmap_scan_filters;
+	if (logical_get->function.name == "bitmap_index_scan" && logical_get->bind_data) {
+		auto &bind = logical_get->bind_data->Cast<BitmapIndexScanBindData>();
+		auto &bitmap_index = bind.index.Cast<BitmapIndex>();
+		if (!bind.filter_value.IsNull()) {
+			for (auto column_id : bitmap_index.GetColumnIds()) {
+				if (column_id >= columns.LogicalColumnCount()) {
+					continue;
+				}
+				bitmap_scan_filters.emplace_back(column_id, bind.filter_value);
+				filter_table_cols.push_back(column_id);
+			}
+		}
+	}
+
+	// Build fetch column order (output columns first, then filter-only columns)
+	unordered_set<idx_t> seen_cols;
+	vector<idx_t> fetch_columns;
+	auto add_column = [&](idx_t col_idx) {
+		if (seen_cols.insert(col_idx).second) {
+			fetch_columns.push_back(col_idx);
+		}
+	};
+	for (auto col : output_table_cols) {
+		add_column(col);
+	}
+	for (auto col : filter_table_cols) {
+		add_column(col);
+	}
+
+	// Build types for fetch chunk
+	vector<LogicalType> fetch_types;
+	fetch_types.reserve(fetch_columns.size());
+	for (auto col_idx : fetch_columns) {
+		if (col_idx >= columns.LogicalColumnCount()) {
+			return false;
+		}
+		auto &col = columns.GetColumn(LogicalIndex(col_idx));
+		fetch_types.push_back(col.Type());
+	}
+
+	// Map columns to positions for copying/filtering
+	unordered_map<idx_t, idx_t> column_pos_map;
+	for (idx_t i = 0; i < fetch_columns.size(); i++) {
+		column_pos_map[fetch_columns[i]] = i;
+	}
+
+	// Build output fetch map
+	vector<idx_t> output_fetch_map;
+	output_fetch_map.reserve(output_table_cols.size());
+	for (auto col : output_table_cols) {
+		output_fetch_map.push_back(column_pos_map[col]);
+	}
+
+	// Remap filter expressions to reference chunk positions
+	vector<unique_ptr<Expression>> remapped_filters;
+	for (auto &expr : filter_expressions) {
+		remapped_filters.push_back(
+		    RemapFilterExpression(*expr, child, *logical_get, column_pos_map, fetch_types));
+	}
+	for (auto &scan_filter : bitmap_scan_filters) {
+		auto entry = column_pos_map.find(scan_filter.first);
+		if (entry == column_pos_map.end()) {
+			continue;
+		}
+		auto ref = make_uniq<BoundReferenceExpression>(fetch_types[entry->second], entry->second);
+		auto constant = make_uniq<BoundConstantExpression>(scan_filter.second);
+		auto cmp = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(ref),
+		                                                std::move(constant));
+		remapped_filters.push_back(std::move(cmp));
+	}
+
+	unique_ptr<Expression> filter_expression;
+	if (!remapped_filters.empty()) {
+		if (remapped_filters.size() == 1) {
+			filter_expression = std::move(remapped_filters[0]);
+		} else {
+			auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+			for (auto &expr : remapped_filters) {
+				conjunction->children.push_back(std::move(expr));
+			}
+			filter_expression = std::move(conjunction);
+		}
+	}
+
+	info.fetch_table_columns = std::move(fetch_columns);
+	info.fetch_column_types = std::move(fetch_types);
+	info.output_fetch_map = std::move(output_fetch_map);
+	info.filter_expression = std::move(filter_expression);
+	return true;
+}
+
 } // namespace
 
 LogicalBitmapIndexJoin::LogicalBitmapIndexJoin(JoinType join_type, vector<JoinCondition> conditions,
@@ -131,13 +418,16 @@ LogicalBitmapIndexJoin::LogicalBitmapIndexJoin(JoinType join_type, vector<JoinCo
                                                string bitmap_index_name, idx_t bitmap_index_table_index,
                                                bool probe_on_left, vector<idx_t> left_projection_map,
                                                vector<idx_t> right_projection_map,
-                                               vector<unique_ptr<BaseStatistics>> join_stats)
+                                               vector<unique_ptr<BaseStatistics>> join_stats,
+                                               vector<unique_ptr<Expression>> left_filters_p,
+                                               vector<unique_ptr<Expression>> right_filters_p)
     : LogicalExtensionOperator(), join_type(join_type), conditions(std::move(conditions)),
       bitmap_index_schema(std::move(bitmap_index_schema)),
       bitmap_index_table_name(std::move(bitmap_index_table_name)),
       bitmap_index_name(std::move(bitmap_index_name)), bitmap_index_table_index(bitmap_index_table_index),
       build_on_left(probe_on_left), left_projection_map(std::move(left_projection_map)),
-      right_projection_map(std::move(right_projection_map)), join_stats(std::move(join_stats)) {
+      right_projection_map(std::move(right_projection_map)), join_stats(std::move(join_stats)),
+      left_filters(std::move(left_filters_p)), right_filters(std::move(right_filters_p)) {
 	// Add children (left and right)
 	D_ASSERT(children.empty());
 }
@@ -203,6 +493,9 @@ void LogicalBitmapIndexJoin::ResolveColumnBindings(ColumnBindingResolver &res, v
 		}
 		res.VisitExpression(&cond.left);
 	}
+	for (auto &expr : left_filters) {
+		res.VisitExpression(&expr);
+	}
 	
 	// Then get the bindings of the RHS and resolve the RHS expressions
 	res.VisitOperator(*children[1]);
@@ -217,6 +510,9 @@ void LogicalBitmapIndexJoin::ResolveColumnBindings(ColumnBindingResolver &res, v
 			}
 		}
 		res.VisitExpression(&cond.right);
+	}
+	for (auto &expr : right_filters) {
+		res.VisitExpression(&expr);
 	}
 	
 	// Finally update the bindings with the result bindings of the join
@@ -261,6 +557,27 @@ PhysicalOperator &LogicalBitmapIndexJoin::CreatePlan(ClientContext &context, Phy
 		throw InvalidInputException(
 		    "Bitmap index join requires direct table column mapping on the indexed table (encountered complex subtree)");
 	}
+
+	BitmapBuildPlanInfo build_info;
+	vector<LogicalType> build_fetch_types;
+	vector<idx_t> build_output_fetch_map;
+	unique_ptr<Expression> build_filter_expression;
+	if (bitmap_index_table_index == 0) {
+		const auto *extra_filters = left_filters.empty() ? nullptr : &left_filters;
+		if (!PrepareBuildSideInfo(*children[0], left_projection_map, duck_table, build_info, extra_filters)) {
+			throw InvalidInputException("Bitmap index join requires direct column mapping for indexed table (left)");
+		}
+		left_table_col_indices = build_info.fetch_table_columns;
+	} else {
+		const auto *extra_filters = right_filters.empty() ? nullptr : &right_filters;
+		if (!PrepareBuildSideInfo(*children[1], right_projection_map, duck_table, build_info, extra_filters)) {
+			throw InvalidInputException("Bitmap index join requires direct column mapping for indexed table (right)");
+		}
+		right_table_col_indices = build_info.fetch_table_columns;
+	}
+	build_fetch_types = build_info.fetch_column_types;
+	build_output_fetch_map = build_info.output_fetch_map;
+	build_filter_expression = std::move(build_info.filter_expression);
 	auto left_output_types_copy = LogicalJoin::MapTypes(children[0]->types, left_projection_map);
 	auto right_output_types_copy = LogicalJoin::MapTypes(children[1]->types, right_projection_map);
 
@@ -319,7 +636,8 @@ PhysicalOperator &LogicalBitmapIndexJoin::CreatePlan(ClientContext &context, Phy
 	auto &bitmap_join = planner.Make<PhysicalBitmapIndexJoin>(
 	    *this, *left, *right, join_type, std::move(conditions), condition_types, std::move(left_output_types_copy),
 	    std::move(right_output_types_copy), bitmap_index_table_index, bitmap_index, &duck_table, build_on_left,
-	    left_projection_map, right_projection_map, std::move(left_table_col_indices), std::move(right_table_col_indices));
+	    left_projection_map, right_projection_map, std::move(left_table_col_indices), std::move(right_table_col_indices),
+	    std::move(build_output_fetch_map), std::move(build_fetch_types), std::move(build_filter_expression));
 
 	return bitmap_join;
 }

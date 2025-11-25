@@ -35,14 +35,19 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
                                                  bool build_on_left, vector<idx_t> left_projection_map,
                                                  vector<idx_t> right_projection_map,
                                                  vector<idx_t> left_table_col_indices_p,
-                                                 vector<idx_t> right_table_col_indices_p)
+                                                 vector<idx_t> right_table_col_indices_p,
+                                                 vector<idx_t> build_output_fetch_map_p,
+                                                 vector<LogicalType> build_fetch_types_p,
+                                                 unique_ptr<Expression> build_filter_expression_p)
     : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type,
                              op.estimated_cardinality),
       condition_types(std::move(condition_types)), left_output_meta(std::move(left_output_meta_p)),
       right_output_meta(std::move(right_output_meta_p)), left_table_col_indices(std::move(left_table_col_indices_p)),
       right_table_col_indices(std::move(right_table_col_indices_p)), bitmap_index(bitmap_index),
       bitmap_index_table(bitmap_index_table), bitmap_index_table_index(bitmap_index_table_index),
-      build_on_left(build_on_left) {
+      build_on_left(build_on_left), build_output_fetch_map(std::move(build_output_fetch_map_p)),
+      build_fetch_types(std::move(build_fetch_types_p)),
+      build_filter_expression(std::move(build_filter_expression_p)) {
 	// Disable chunk caching: bitmap lookup already produces compact batches
 	this->caching_supported = false;
 
@@ -124,6 +129,16 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
 		build_table_col_indices = right_table_col_indices;
 	}
 
+	if (bitmap_index_table) {
+		auto &columns = bitmap_index_table->GetColumns();
+		for (auto table_col_idx : build_table_col_indices) {
+			if (table_col_idx < columns.LogicalColumnCount()) {
+				auto physical_idx = columns.LogicalToPhysical(LogicalIndex(table_col_idx));
+				build_storage_indices.push_back(StorageIndex(physical_idx.index));
+			}
+		}
+	}
+
 	// Payload columns correspond to the build side (only meaningful when there are RHS outputs)
 	if (build_on_left) {
 		payload_columns.col_idxs = lhs_output_columns.col_idxs;
@@ -178,6 +193,13 @@ PhysicalBitmapIndexJoin::BitmapIndexJoinOperatorState::BitmapIndexJoinOperatorSt
 	}
 	if (!op.rhs_output_columns.col_types.empty()) {
 		rhs_output.Initialize(allocator, op.rhs_output_columns.col_types);
+	}
+	if (!op.build_fetch_types.empty()) {
+		build_chunk.Initialize(allocator, op.build_fetch_types);
+	}
+	if (op.build_filter_expression) {
+		build_filter_executor = make_uniq<ExpressionExecutor>(context.client, *op.build_filter_expression);
+		build_filter_sel.Initialize(STANDARD_VECTOR_SIZE);
 	}
 }
 
@@ -403,61 +425,28 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 	// Gather rows from bitmap index table
 	auto &tx = DuckTransaction::Get(context.client, bitmap_index_table->catalog);
 	auto &storage = bitmap_index_table->GetStorage();
-
-	// Determine build/probe chunks
 	const bool build_is_left = build_on_left;
-	auto &build_chunk = build_is_left ? state.lhs_output : state.rhs_output;
-	auto &build_columns = build_is_left ? lhs_output_columns : rhs_output_columns;
+	auto &build_chunk = state.build_chunk;
 
-	// Fetch build side columns from table when required
-	if (!build_columns.col_idxs.empty()) {
-		// Convert table column indices to storage indices
-		vector<StorageIndex> storage_indices;
-		auto &columns = bitmap_index_table->GetColumns();
-		const auto &table_col_indices =
-		    build_table_col_indices.empty() ? build_columns.col_idxs : build_table_col_indices;
-		for (auto table_col_idx : table_col_indices) {
-			if (table_col_idx < columns.LogicalColumnCount()) {
-				auto physical_idx = columns.LogicalToPhysical(LogicalIndex(table_col_idx));
-				storage_indices.push_back(StorageIndex(physical_idx.index));
-			}
+	if (!build_storage_indices.empty()) {
+		build_chunk.Reset();
+		for (idx_t i = 0; i < build_chunk.ColumnCount(); i++) {
+			build_chunk.data[i].SetVectorType(VectorType::FLAT_VECTOR);
 		}
-		if (!storage_indices.empty()) {
-			build_chunk.Reset();
-			for (idx_t i = 0; i < build_chunk.ColumnCount(); i++) {
-				build_chunk.data[i].SetVectorType(VectorType::FLAT_VECTOR);
-			}
+		storage.Fetch(tx, build_chunk, build_storage_indices, row_id_vector, fetch_count, state.fetch_state);
+		fetch_count = build_chunk.size();
 
-			storage.Fetch(tx, build_chunk, storage_indices, row_id_vector, fetch_count, state.fetch_state);
-			// Fetch 已经设置了正确的 cardinality（实际 fetch 到的行数）
-			// 绝对不要覆盖它！使用 Fetch 返回的实际行数
-			idx_t actual_fetched_count = build_chunk.size();
-			
-			if (actual_fetched_count == 0) {
-				// 没有 fetch 到任何数据，跳过这些 row_ids，继续下一个
-				state.row_id_pos += fetch_count;
-				if (state.row_id_pos >= row_ids.size()) {
-					state.match_pos++;
-					state.row_id_pos = 0;
-					if (state.match_pos >= state.row_id_matches.size()) {
-						state.has_buffered_matches = false;
-						return OperatorResultType::NEED_MORE_INPUT;
-					}
-				}
-				return OperatorResultType::HAVE_MORE_OUTPUT;
+		if (fetch_count > 0 && state.build_filter_executor) {
+			auto passed = state.build_filter_executor->SelectExpression(build_chunk, state.build_filter_sel);
+			if (passed == 0) {
+				fetch_count = 0;
+			} else if (passed != fetch_count) {
+				build_chunk.Slice(state.build_filter_sel, passed);
+				fetch_count = passed;
 			}
-			
-			// 使用实际 fetch 到的行数
-			fetch_count = actual_fetched_count;
-		} else {
-			// 如果没有需要 fetch 的列，设置 cardinality 为 0
-			build_chunk.SetCardinality(0);
-			fetch_count = 0;
 		}
 	} else {
-		// 如果不需要 fetch build table 的列，设置 cardinality 为 0
-		build_chunk.SetCardinality(0);
-		fetch_count = 0;
+		build_chunk.SetCardinality(fetch_count);
 	}
 
 	// 如果 fetch_count 为 0，直接返回
@@ -502,7 +491,8 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 	for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 		auto &dst = chunk.data[i];
 		if (build_is_left) {
-			VectorOperations::Copy(state.lhs_output.data[i], dst, fetch_count, 0, 0);
+			auto src_idx = build_output_fetch_map.empty() ? i : build_output_fetch_map[i];
+			VectorOperations::Copy(build_chunk.data[src_idx], dst, fetch_count, 0, 0);
 		} else {
 			repeat_probe_row(state.lhs_output, i, dst);
 		}
@@ -514,13 +504,14 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 		auto &dst = chunk.data[offset + i];
 		dst.SetVectorType(VectorType::FLAT_VECTOR);
 		if (!build_is_left) {
-			VectorOperations::Copy(state.rhs_output.data[i], dst, fetch_count, 0, 0);
+			auto src_idx = build_output_fetch_map.empty() ? i : build_output_fetch_map[i];
+			VectorOperations::Copy(build_chunk.data[src_idx], dst, fetch_count, 0, 0);
 		} else {
 			repeat_probe_row(state.rhs_output, i, dst);
 		}
 	}
 
-	state.row_id_pos += fetch_count;
+	state.row_id_pos += row_ids_to_process;
 	if (state.row_id_pos >= row_ids.size()) {
 		// Move to next match
 		state.match_pos++;

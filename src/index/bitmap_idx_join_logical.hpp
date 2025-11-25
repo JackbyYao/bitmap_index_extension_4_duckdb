@@ -26,6 +26,9 @@ public:
 	// bitmap_index_table_index: 0 = left child, 1 = right child
 	idx_t bitmap_index_table_index;
 	bool build_on_left;
+	//! Residual predicates that reference only the left or right child
+	vector<unique_ptr<Expression>> left_filters;
+	vector<unique_ptr<Expression>> right_filters;
 
 	// Projection maps (from LogicalJoin)
 	vector<idx_t> left_projection_map;
@@ -39,7 +42,9 @@ public:
 	                       string bitmap_index_schema, string bitmap_index_table_name, string bitmap_index_name,
 	                       idx_t bitmap_index_table_index, bool probe_on_left,
 	                       vector<idx_t> left_projection_map, vector<idx_t> right_projection_map,
-	                       vector<unique_ptr<BaseStatistics>> join_stats);
+	                       vector<unique_ptr<BaseStatistics>> join_stats,
+	                       vector<unique_ptr<Expression>> left_filters_p,
+	                       vector<unique_ptr<Expression>> right_filters_p);
 
 	void ResolveTypes() override;
 	vector<ColumnBinding> GetColumnBindings() override;
@@ -63,4 +68,3 @@ public:
 };
 
 } // namespace duckdb
-

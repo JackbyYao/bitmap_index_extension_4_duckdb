@@ -2,8 +2,10 @@
 
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "index/bitmap_idx.hpp"
 
 namespace duckdb {
@@ -25,7 +27,9 @@ public:
 	                        vector<LogicalType> right_output_meta_p, idx_t bitmap_index_table_index,
 	                        BitmapIndex *bitmap_index, DuckTableEntry *bitmap_index_table, bool build_on_left,
 	                        vector<idx_t> left_projection_map, vector<idx_t> right_projection_map,
-	                        vector<idx_t> left_table_col_indices_p = {}, vector<idx_t> right_table_col_indices_p = {});
+	                        vector<idx_t> left_table_col_indices_p = {}, vector<idx_t> right_table_col_indices_p = {},
+	                        vector<idx_t> build_output_fetch_map_p = {}, vector<LogicalType> build_fetch_types_p = {},
+	                        unique_ptr<Expression> build_filter_expression_p = nullptr);
 
 	//! The types of the join keys
 	vector<LogicalType> condition_types;
@@ -43,6 +47,14 @@ public:
 	vector<idx_t> right_table_col_indices;
 	//! Table column indices for the build side when fetching from storage
 	vector<idx_t> build_table_col_indices;
+	//! Mapping from output columns on the build side to positions within build_chunk
+	vector<idx_t> build_output_fetch_map;
+	//! Column types for build fetch chunk
+	vector<LogicalType> build_fetch_types;
+	//! Optional filter expression to apply on fetched build-side rows
+	unique_ptr<Expression> build_filter_expression;
+	//! Physical storage column indices for fetching
+	vector<StorageIndex> build_storage_indices;
 
 	//! Bitmap index reference
 	BitmapIndex *bitmap_index;
@@ -110,6 +122,8 @@ struct PhysicalBitmapIndexJoin::BitmapIndexJoinOperatorState : public CachingOpe
 	DataChunk lhs_output;
 	// Buffer for right side output (gathered from bitmap index)
 	DataChunk rhs_output;
+	// Buffer for fetched build-side columns (for output/filtering)
+	DataChunk build_chunk;
 	// Buffer for casting join keys to logical type
 	unique_ptr<Vector> cast_key_vector;
 	// Row IDs from bitmap index lookup, grouped by left row index
@@ -123,6 +137,9 @@ struct PhysicalBitmapIndexJoin::BitmapIndexJoinOperatorState : public CachingOpe
 	vector<bool> left_row_matched;
 	// Fetch state for gathering rows
 	ColumnFetchState fetch_state;
+	// Optional executor for build-side filters
+	unique_ptr<ExpressionExecutor> build_filter_executor;
+	SelectionVector build_filter_sel;
 	// Whether we have buffered matches to output
 	bool has_buffered_matches = false;
 };

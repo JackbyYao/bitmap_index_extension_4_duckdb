@@ -9,8 +9,11 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -98,6 +101,101 @@ static bool ExpressionBelongsToSubtree(Expression &expr, LogicalOperator &subtre
 		}
 	}
 	
+	return false;
+}
+
+static void SplitConjunction(Expression &expr, vector<unique_ptr<Expression>> &out) {
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		for (auto &child : conj.children) {
+			SplitConjunction(*child, out);
+		}
+		return;
+	}
+	out.push_back(expr.Copy());
+}
+
+static bool ContainsInequality(Expression &expr) {
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::COMPARE_EQUAL:
+		return false;
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+		return false;
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return true;
+	default:
+		break;
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		if (ContainsInequality(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+static bool OperatorHasInequalityExpressions(LogicalOperator &op) {
+	for (auto &expr : op.expressions) {
+		if (expr && ContainsInequality(*expr)) {
+			return true;
+		}
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op.Cast<LogicalFilter>();
+		for (auto &expr : filter.expressions) {
+			if (ContainsInequality(*expr)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool SubtreeHasInequalityExpressions(LogicalOperator &op) {
+	if (OperatorHasInequalityExpressions(op)) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (SubtreeHasInequalityExpressions(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool PlanHasInequalityExpressions(LogicalOperator &op) {
+	if (OperatorHasInequalityExpressions(op)) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (PlanHasInequalityExpressions(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool HasUnsupportedTableFilters(LogicalOperator &op) {
+	auto logical_get = FindLogicalGet(&op);
+	if (!logical_get) {
+		return false;
+	}
+	for (auto &entry : logical_get->table_filters.filters) {
+		auto &filter = *entry.second;
+		if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+			auto &cmp = filter.Cast<ConstantFilter>();
+			if (cmp.comparison_type != ExpressionType::COMPARE_EQUAL) {
+				return true;
+			}
+		} else {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -304,6 +402,64 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		return;
 	}
 
+	// Handle filters: try to optimize child first and attach build-side predicates to bitmap join
+	if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = plan->Cast<LogicalFilter>();
+		if (!filter.children.empty()) {
+			auto &child = filter.children[0];
+
+			bool block_child_optimization = false;
+				if (!filter.expressions.empty()) {
+					for (auto &expr : filter.expressions) {
+						if (ContainsInequality(*expr)) {
+							block_child_optimization = true;
+							break;
+						}
+					}
+				}
+
+			if (block_child_optimization) {
+				for (auto &grandchild : child->children) {
+					OptimizeRecursive(input, grandchild);
+				}
+				return;
+			}
+
+			OptimizeRecursive(input, child);
+
+			if (child && child->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+				if (auto *bitmap_join = dynamic_cast<LogicalBitmapIndexJoin *>(child.get())) {
+					vector<unique_ptr<Expression>> remaining;
+					for (auto &expr : filter.expressions) {
+						bool references_left = ExpressionBelongsToSubtree(*expr, *bitmap_join->children[0]);
+						bool references_right = ExpressionBelongsToSubtree(*expr, *bitmap_join->children[1]);
+						bool consumed = false;
+						if (bitmap_join->bitmap_index_table_index == 0 && references_left && !references_right) {
+							bitmap_join->left_filters.push_back(std::move(expr));
+							consumed = true;
+						} else if (bitmap_join->bitmap_index_table_index == 1 && references_right && !references_left) {
+							bitmap_join->right_filters.push_back(std::move(expr));
+							consumed = true;
+						}
+						if (!consumed) {
+							remaining.push_back(std::move(expr));
+						}
+					}
+					filter.expressions = std::move(remaining);
+					if (filter.expressions.empty()) {
+						plan = std::move(child);
+						return;
+					}
+				}
+			}
+		}
+		// Still have a filter - continue optimizing inside remaining children
+		for (auto &child : filter.children) {
+			OptimizeRecursive(input, child);
+		}
+		return;
+	}
+
 	// Check if this is a join we can optimize
 	if (plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
@@ -354,6 +510,12 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			left_index = FindBitmapIndexOnJoinKey(input.context, *plan->children[0], *left_get, *first_cond.left);
 			right_index = FindBitmapIndexOnJoinKey(input.context, *plan->children[1], *right_get, *first_cond.right);
 		}
+
+		// Extract single-side predicates (if any)
+		vector<unique_ptr<Expression>> left_filters;
+		vector<unique_ptr<Expression>> right_filters;
+		bool left_has_inequality = SubtreeHasInequalityExpressions(*plan->children[0]);
+		bool right_has_inequality = SubtreeHasInequalityExpressions(*plan->children[1]);
 
 		// Decision logic:
 		// 1. If neither table has bitmap index -> no optimization
@@ -412,6 +574,12 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			bitmap_index_name = right_index->name;
 		}
 
+		bool build_has_inequality = bitmap_index_table_index == 0 ? left_has_inequality : right_has_inequality;
+		bool build_has_unsupported_filters = HasUnsupportedTableFilters(*plan->children[bitmap_index_table_index]);
+		if (build_has_inequality || build_has_unsupported_filters) {
+			goto optimize_children;
+		}
+
 		// Copy join statistics
 		vector<unique_ptr<BaseStatistics>> join_stats_copy;
 		for (auto &stat : join.join_stats) {
@@ -448,7 +616,9 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			probe_on_left, 
 			join.left_projection_map, // projections on left table [idx of columns]
 			join.right_projection_map, // projections on right table [idx of columns]
-		    std::move(join_stats_copy)
+		    std::move(join_stats_copy),
+		    std::move(left_filters),
+		    std::move(right_filters)
 		);
 
 		// Copy children
@@ -473,6 +643,9 @@ void BitmapIndexJoinOptimizer::DisableCompressedMaterializationIfNeeded(Optimize
 }
 
 void BitmapIndexJoinOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (plan && PlanHasInequalityExpressions(*plan)) {
+		return;
+	}
 	OptimizeRecursive(input, plan);
 }
 
@@ -488,4 +661,3 @@ void BitmapIndexModule::RegisterBitmapIndexJoin(ExtensionLoader &loader) {
 }
 
 } // namespace duckdb
-
