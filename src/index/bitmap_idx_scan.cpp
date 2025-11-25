@@ -114,8 +114,8 @@ static void GatherRows(RowGroup &row_group, TransactionData &transaction_data, c
 		col_data.InitializeScanWithOffset(scan_state, vector_start);
 
 		Vector temp(col_data.type);
-		auto global_vector_index = vector_start / STANDARD_VECTOR_SIZE;
-		col_data.Scan(transaction_data, global_vector_index, scan_state, temp);
+		// Scan expects a vector index relative to the current row group, not a global index.
+		col_data.Scan(transaction_data, local_vector_index, scan_state, temp);
 		// Copy directly using the selection vector - temp contains the full vector,
 		// and sel contains the indices we want to copy
 		VectorOperations::Copy(temp, result_vector, sel, valid_count, 0, offset, valid_count);
