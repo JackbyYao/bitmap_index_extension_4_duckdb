@@ -17,8 +17,9 @@ public:
 	PhysicalBitmapIndexLookup(PhysicalPlan &physical_plan, vector<LogicalType> types, 
 	                          DuckTableEntry &table, BitmapIndex &bitmap_index, 
 	                          idx_t estimated_cardinality)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::DUMMY_SCAN, std::move(types), estimated_cardinality),
-	      table(table), bitmap_index(bitmap_index) {
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::DUMMY_SCAN, std::move(types), estimated_cardinality), // use DUMMY SCAN as its virtual
+	      table(table), 
+		  bitmap_index(bitmap_index) {
 	}
 
 	DuckTableEntry &table;

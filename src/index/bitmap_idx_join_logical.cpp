@@ -8,23 +8,135 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/common/constants.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 
 namespace duckdb {
 
+namespace {
+
+static LogicalGet *FindLogicalGetInSubtree(LogicalOperator *op) {
+	if (!op) {
+		return nullptr;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		return &op->Cast<LogicalGet>();
+	}
+	if (op->children.size() == 1) {
+		switch (op->type) {
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+			return FindLogicalGetInSubtree(op->children[0].get());
+		default:
+			break;
+		}
+	}
+	return nullptr;
+}
+
+static idx_t TraceBindingToLogicalGet(LogicalOperator &op, ColumnBinding binding, LogicalGet *target_get) {
+	if (!target_get) {
+		return DConstants::INVALID_INDEX;
+	}
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		if (&get != target_get) {
+			return DConstants::INVALID_INDEX;
+		}
+		if (get.table_index != binding.table_index) {
+			return DConstants::INVALID_INDEX;
+		}
+		return binding.column_index;
+	}
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &projection = op.Cast<LogicalProjection>();
+		if (binding.table_index != projection.table_index || binding.column_index >= projection.expressions.size()) {
+			return DConstants::INVALID_INDEX;
+		}
+		auto &expr = projection.expressions[binding.column_index];
+		if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+			auto &bound_colref = expr->Cast<BoundColumnRefExpression>();
+			return TraceBindingToLogicalGet(*projection.children[0], bound_colref.binding, target_get);
+		}
+		return DConstants::INVALID_INDEX;
+	}
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+		if (op.children.size() == 1) {
+			return TraceBindingToLogicalGet(*op.children[0], binding, target_get);
+		}
+		return DConstants::INVALID_INDEX;
+	default:
+		return DConstants::INVALID_INDEX;
+	}
+}
+
+// collect the column indices (for duckdb ColumnList) from projection map (operator column)
+static bool CollectTableColumnIndices(LogicalOperator &child, const vector<idx_t> &projection_map,
+                                      vector<idx_t> &result) {
+    result.clear();
+    auto logical_get = FindLogicalGetInSubtree(&child);
+    if (!logical_get) {
+        return false;
+    }
+
+    auto child_bindings = child.GetColumnBindings();
+    auto &column_ids = logical_get->GetColumnIds();
+
+    auto append_column = [&](idx_t child_output_idx) -> bool {
+        if (child_output_idx >= child_bindings.size()) {
+            return false;
+        }
+        auto binding = child_bindings[child_output_idx];
+        auto mapped_idx = TraceBindingToLogicalGet(child, binding, logical_get);
+        if (mapped_idx == DConstants::INVALID_INDEX || mapped_idx >= column_ids.size()) {
+            return false;
+        }
+        auto column_id = column_ids[mapped_idx];
+        if (column_id.IsVirtualColumn()) {
+            return false;
+        }
+        result.push_back(column_id.GetPrimaryIndex());
+        return true;
+    };
+
+    if (projection_map.empty()) {
+        for (idx_t i = 0; i < child_bindings.size(); i++) {
+            if (!append_column(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    for (auto proj_idx : projection_map) {
+        if (!append_column(proj_idx)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 LogicalBitmapIndexJoin::LogicalBitmapIndexJoin(JoinType join_type, vector<JoinCondition> conditions,
                                                string bitmap_index_schema, string bitmap_index_table_name,
                                                string bitmap_index_name, idx_t bitmap_index_table_index,
-                                               bool build_on_left, vector<idx_t> left_projection_map,
+                                               bool probe_on_left, vector<idx_t> left_projection_map,
                                                vector<idx_t> right_projection_map,
                                                vector<unique_ptr<BaseStatistics>> join_stats)
     : LogicalExtensionOperator(), join_type(join_type), conditions(std::move(conditions)),
       bitmap_index_schema(std::move(bitmap_index_schema)),
       bitmap_index_table_name(std::move(bitmap_index_table_name)),
       bitmap_index_name(std::move(bitmap_index_name)), bitmap_index_table_index(bitmap_index_table_index),
-      build_on_left(build_on_left), left_projection_map(std::move(left_projection_map)),
+      build_on_left(probe_on_left), left_projection_map(std::move(left_projection_map)),
       right_projection_map(std::move(right_projection_map)), join_stats(std::move(join_stats)) {
 	// Add children (left and right)
 	D_ASSERT(children.empty());
@@ -138,37 +250,19 @@ PhysicalOperator &LogicalBitmapIndexJoin::CreatePlan(ClientContext &context, Phy
 		throw InternalException("Bitmap index '%s' not found on table '%s'", bitmap_index_name, bitmap_index_table_name);
 	}
 
-	// Map right_projection_map to table column indices if bitmap index is on right table
-	// This is needed because we fetch data directly from the table, not from the child
+	// Determine table column indices for both children (if possible)
+	vector<idx_t> left_table_col_indices;
 	vector<idx_t> right_table_col_indices;
-	if (bitmap_index_table_index == 1) {
-		// Bitmap index is on right table - need to map projection indices to table column indices
-		// Simple case: if right child is LogicalGet, map directly through column_ids
-		LogicalOperator* right_child = children[1].get();
-		if (right_child->type == LogicalOperatorType::LOGICAL_GET) {
-			auto &right_get = right_child->Cast<LogicalGet>();
-			auto &column_ids = right_get.GetColumnIds();
-			if (right_projection_map.empty()) {
-				// No projection map - use all columns
-				for (idx_t i = 0; i < column_ids.size(); i++) {
-					if (!column_ids[i].IsVirtualColumn()) {
-						right_table_col_indices.push_back(column_ids[i].GetPrimaryIndex());
-					}
-				}
-			} else {
-				// Map projection indices to table column indices
-				for (auto proj_idx : right_projection_map) {
-					if (proj_idx < column_ids.size() && !column_ids[proj_idx].IsVirtualColumn()) {
-						right_table_col_indices.push_back(column_ids[proj_idx].GetPrimaryIndex());
-					}
-				}
-			}
-		} else {
-			// Right child is not a simple LogicalGet - can't easily map
-			// For now, assume projection map indices are table column indices (may be wrong)
-			right_table_col_indices = right_projection_map;
-		}
+	bool left_mapping_ok = CollectTableColumnIndices(*children[0], left_projection_map, left_table_col_indices);
+	bool right_mapping_ok = CollectTableColumnIndices(*children[1], right_projection_map, right_table_col_indices);
+	// Only the table that actually owns the bitmap index needs physical column mapping
+	if ((bitmap_index_table_index == 0 && !left_mapping_ok) ||
+	    (bitmap_index_table_index == 1 && !right_mapping_ok)) {
+		throw InvalidInputException(
+		    "Bitmap index join requires direct table column mapping on the indexed table (encountered complex subtree)");
 	}
+	auto left_output_types_copy = LogicalJoin::MapTypes(children[0]->types, left_projection_map);
+	auto right_output_types_copy = LogicalJoin::MapTypes(children[1]->types, right_projection_map);
 
 	// Create physical plans for children
 	// For the build side (the table with bitmap index), create a virtual operator
@@ -221,11 +315,11 @@ PhysicalOperator &LogicalBitmapIndexJoin::CreatePlan(ClientContext &context, Phy
 
 	// Create the physical operator
 	// Note: Make automatically passes physical_plan as first argument
-	// Pass the mapped table column indices for right table if available
+	// Pass the mapped table column indices so the physical join can fetch directly from storage
 	auto &bitmap_join = planner.Make<PhysicalBitmapIndexJoin>(
-	    *this, *left, *right, join_type, std::move(conditions), condition_types,
-	    bitmap_index_table_index, bitmap_index, &duck_table, build_on_left, left_projection_map,
-	    right_projection_map, right_table_col_indices);
+	    *this, *left, *right, join_type, std::move(conditions), condition_types, std::move(left_output_types_copy),
+	    std::move(right_output_types_copy), bitmap_index_table_index, bitmap_index, &duck_table, build_on_left,
+	    left_projection_map, right_projection_map, std::move(left_table_col_indices), std::move(right_table_col_indices));
 
 	return bitmap_join;
 }
@@ -238,7 +332,7 @@ void LogicalBitmapIndexJoin::Serialize(Serializer &writer) const {
 	writer.WriteProperty(203, "bitmap_index_table_name", bitmap_index_table_name);
 	writer.WriteProperty(204, "bitmap_index_name", bitmap_index_name);
 	writer.WriteProperty(205, "bitmap_index_table_index", bitmap_index_table_index);
-	writer.WriteProperty(206, "build_on_left", build_on_left);
+	writer.WriteProperty(206, "probe_on_left", build_on_left);
 	writer.WriteProperty(207, "left_projection_map", left_projection_map);
 	writer.WriteProperty(208, "right_projection_map", right_projection_map);
 	// Note: BaseStatistics serialization may need special handling

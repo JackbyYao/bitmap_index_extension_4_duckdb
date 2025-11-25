@@ -21,13 +21,16 @@ public:
 public:
 	PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
 	                        PhysicalOperator &right, JoinType join_type, vector<JoinCondition> cond,
-	                        vector<LogicalType> condition_types, idx_t bitmap_index_table_index,
+	                        vector<LogicalType> condition_types, vector<LogicalType> left_output_meta_p,
+	                        vector<LogicalType> right_output_meta_p, idx_t bitmap_index_table_index,
 	                        BitmapIndex *bitmap_index, DuckTableEntry *bitmap_index_table, bool build_on_left,
 	                        vector<idx_t> left_projection_map, vector<idx_t> right_projection_map,
-	                        vector<idx_t> right_table_col_indices = {});
+	                        vector<idx_t> left_table_col_indices_p = {}, vector<idx_t> right_table_col_indices_p = {});
 
 	//! The types of the join keys
 	vector<LogicalType> condition_types;
+	vector<LogicalType> left_output_meta;
+	vector<LogicalType> right_output_meta;
 
 	//! The indices/types of the payload columns (from build side)
 	JoinProjectionColumns payload_columns;
@@ -35,6 +38,9 @@ public:
 	JoinProjectionColumns lhs_output_columns;
 	//! The indices/types of the rhs columns that need to be output
 	JoinProjectionColumns rhs_output_columns;
+	//! Table column indices for the logical left/right children
+	vector<idx_t> left_table_col_indices;
+	vector<idx_t> right_table_col_indices;
 	//! Table column indices for the build side when fetching from storage
 	vector<idx_t> build_table_col_indices;
 
@@ -44,7 +50,7 @@ public:
 	DuckTableEntry *bitmap_index_table;
 	//! Which table has the bitmap index (0 = left, 1 = right)
 	idx_t bitmap_index_table_index;
-	//! Whether to build hash table on left side
+	//! Whether to use bitmap index on left side
 	bool build_on_left;
 	//! True if the probe side is the left child in the physical plan
 	bool probe_side_is_left = true;

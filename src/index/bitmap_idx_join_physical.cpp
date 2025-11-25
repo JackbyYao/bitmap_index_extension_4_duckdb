@@ -22,19 +22,25 @@
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include <unordered_set>
 #include <algorithm>
+#include <iostream>
 
 namespace duckdb {
 
 PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, LogicalOperator &op,
                                                  PhysicalOperator &left, PhysicalOperator &right, JoinType join_type,
                                                  vector<JoinCondition> cond, vector<LogicalType> condition_types,
-                                                 idx_t bitmap_index_table_index, BitmapIndex *bitmap_index,
-                                                 DuckTableEntry *bitmap_index_table, bool build_on_left,
-                                                 vector<idx_t> left_projection_map, vector<idx_t> right_projection_map,
-                                                 vector<idx_t> right_table_col_indices)
+                                                 vector<LogicalType> left_output_meta_p,
+                                                 vector<LogicalType> right_output_meta_p, idx_t bitmap_index_table_index,
+                                                 BitmapIndex *bitmap_index, DuckTableEntry *bitmap_index_table,
+                                                 bool build_on_left, vector<idx_t> left_projection_map,
+                                                 vector<idx_t> right_projection_map,
+                                                 vector<idx_t> left_table_col_indices_p,
+                                                 vector<idx_t> right_table_col_indices_p)
     : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type,
                              op.estimated_cardinality),
-      condition_types(std::move(condition_types)), bitmap_index(bitmap_index),
+      condition_types(std::move(condition_types)), left_output_meta(std::move(left_output_meta_p)),
+      right_output_meta(std::move(right_output_meta_p)), left_table_col_indices(std::move(left_table_col_indices_p)),
+      right_table_col_indices(std::move(right_table_col_indices_p)), bitmap_index(bitmap_index),
       bitmap_index_table(bitmap_index_table), bitmap_index_table_index(bitmap_index_table_index),
       build_on_left(build_on_left) {
 	// Disable chunk caching: bitmap lookup already produces compact batches
@@ -50,8 +56,8 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
 		if (left_is_virtual != right_is_virtual) {
 			probe_side_is_left = !left_is_virtual;
 		} else {
-			// Fallback to metadata if we cannot distinguish based on operator type
-			probe_side_is_left = bitmap_index_table_index != 0;
+			// Fallback to the build flag if we cannot distinguish based on operator type
+			probe_side_is_left = !build_on_left;
 		}
 	}
 
@@ -63,47 +69,15 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
 	// Calculate left output type count
 	idx_t left_output_type_count = 0;
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
-		// Only left side is output
-		left_output_type_count = this->types.size();
-		if (join_type == JoinType::MARK) {
-			// MARK join has one extra BOOLEAN column at the end
-			left_output_type_count--;
-		}
+		left_output_type_count = left_output_meta.size();
 	} else {
-		// Both sides are output
-		// Determine left side count from projection maps
-		if (!left_projection_map.empty()) {
-			left_output_type_count = left_projection_map.size();
-		} else if (!right_projection_map.empty()) {
-			// Infer from right projection map and total types
-			left_output_type_count = this->types.size() - right_projection_map.size();
-		} else {
-			// Both projection maps are empty - need to determine from children
-			// Use the logical left child's type count
-			// Since we don't have direct access to logical children, we use the physical children
-			// The logical left child corresponds to children[0] in the physical plan
-			// (regardless of which side is probe/build)
-			left_output_type_count = children[0].get().GetTypes().size();
-		}
+		left_output_type_count = left_output_meta.size();
 	}
+	D_ASSERT(left_output_type_count <= this->types.size());
 	
-	// Extract left and right types from this->types
-	vector<LogicalType> left_output_types;
-	vector<LogicalType> right_output_types;
-	
-	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
-		// Only left side
-		left_output_types = this->types;
-		if (join_type == JoinType::MARK) {
-			// Remove the MARK column (last one)
-			left_output_types.pop_back();
-		}
-	} else {
-		// Both sides - split this->types into left and right portions
-		D_ASSERT(left_output_type_count <= this->types.size());
-		left_output_types.assign(this->types.begin(), this->types.begin() + left_output_type_count);
-		right_output_types.assign(this->types.begin() + left_output_type_count, this->types.end());
-	}
+	// Extract left and right types using provided metadata
+	vector<LogicalType> left_output_types = left_output_meta;
+	vector<LogicalType> right_output_types = right_output_meta;
 	
 	// Create projection maps for left side (logical left child)
 	lhs_output_columns.col_idxs = left_projection_map;
@@ -135,14 +109,28 @@ PhysicalBitmapIndexJoin::PhysicalBitmapIndexJoin(PhysicalPlan &physical_plan, Lo
 	for (idx_t i = 0; i < right_projection_map_copy.size(); i++) {
 		rhs_output_columns.col_idxs.push_back(right_projection_map_copy[i]);
 		rhs_output_columns.col_types.push_back(right_output_types[i]);
-		payload_columns.col_idxs.push_back(right_projection_map_copy[i]);
-		payload_columns.col_types.push_back(right_output_types[i]);
 	}
 
-	if (bitmap_index_table_index == 0) {
-		build_table_col_indices = lhs_output_columns.col_idxs;
+	// Determine which actual table column indices to use when fetching
+	if (build_on_left) {
+		if (left_table_col_indices.empty()) {
+			left_table_col_indices = lhs_output_columns.col_idxs;
+		}
+		build_table_col_indices = left_table_col_indices;
 	} else {
-		build_table_col_indices = right_table_col_indices.empty() ? rhs_output_columns.col_idxs : right_table_col_indices;
+		if (right_table_col_indices.empty()) {
+			right_table_col_indices = rhs_output_columns.col_idxs;
+		}
+		build_table_col_indices = right_table_col_indices;
+	}
+
+	// Payload columns correspond to the build side (only meaningful when there are RHS outputs)
+	if (build_on_left) {
+		payload_columns.col_idxs = lhs_output_columns.col_idxs;
+		payload_columns.col_types = lhs_output_columns.col_types;
+	} else {
+		payload_columns.col_idxs = rhs_output_columns.col_idxs;
+		payload_columns.col_types = rhs_output_columns.col_types;
 	}
 }
 
@@ -394,9 +382,9 @@ OperatorResultType PhysicalBitmapIndexJoin::ExecuteInternal(ExecutionContext &co
 // Helper method to output buffered matches
 OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionContext &context, DataChunk &chunk,
                                                                  PhysicalBitmapIndexJoin::BitmapIndexJoinOperatorState &state) const {
-	// Get current match
+	// Get current match (row index corresponds to the probe input chunk)
 	auto &match = state.row_id_matches[state.match_pos];
-	idx_t left_row_idx = match.first;
+	idx_t probe_row_idx = match.first;
 	auto &row_ids = match.second;
 
 	// Prepare row ID vector for fetching
@@ -417,7 +405,7 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 	auto &storage = bitmap_index_table->GetStorage();
 
 	// Determine build/probe chunks
-	bool build_is_left = bitmap_index_table_index == 0;
+	const bool build_is_left = build_on_left;
 	auto &build_chunk = build_is_left ? state.lhs_output : state.rhs_output;
 	auto &build_columns = build_is_left ? lhs_output_columns : rhs_output_columns;
 
@@ -500,42 +488,35 @@ OperatorResultType PhysicalBitmapIndexJoin::OutputBufferedMatches(ExecutionConte
 		chunk.data[i].SetVectorType(VectorType::FLAT_VECTOR);
 	}
 
+	auto repeat_probe_row = [&](DataChunk &source_chunk, idx_t col_idx, Vector &dest) {
+		auto &src = source_chunk.data[col_idx];
+		SelectionVector sel(fetch_count);
+		for (idx_t j = 0; j < fetch_count; j++) {
+			sel.set_index(j, probe_row_idx);
+		}
+		dest.Reference(src);
+		dest.Slice(sel, fetch_count);
+	};
+
 	// Copy left side columns
 	for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 		auto &dst = chunk.data[i];
-		if (bitmap_index_table_index == 0) {
-			// Left is build side - copy fetched rows
+		if (build_is_left) {
 			VectorOperations::Copy(state.lhs_output.data[i], dst, fetch_count, 0, 0);
 		} else {
-			// Left is probe side - repeat left row for each match
-			auto &src = state.lhs_output.data[i];
-			SelectionVector sel(fetch_count);
-			for (idx_t j = 0; j < fetch_count; j++) {
-				sel.set_index(j, left_row_idx);
-			}
-			dst.Reference(src);
-			dst.Slice(sel, fetch_count);
+			repeat_probe_row(state.lhs_output, i, dst);
 		}
 	}
 
 	// Copy right side columns via deep copy to chunk-owned buffers
-	// fetch_count 是实际 fetch 到的行数，直接使用
 	idx_t offset = lhs_output_columns.col_idxs.size();
 	for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
 		auto &dst = chunk.data[offset + i];
 		dst.SetVectorType(VectorType::FLAT_VECTOR);
-		if (bitmap_index_table_index == 1) {
-			// Right side is build
+		if (!build_is_left) {
 			VectorOperations::Copy(state.rhs_output.data[i], dst, fetch_count, 0, 0);
 		} else {
-			// Right side is probe - repeat probe row
-			auto &src = state.rhs_output.data[i];
-			SelectionVector sel(fetch_count);
-			for (idx_t j = 0; j < fetch_count; j++) {
-				sel.set_index(j, left_row_idx);
-			}
-			dst.Reference(src);
-			dst.Slice(sel, fetch_count);
+			repeat_probe_row(state.rhs_output, i, dst);
 		}
 	}
 

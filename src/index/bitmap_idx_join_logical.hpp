@@ -37,7 +37,7 @@ public:
 public:
 	LogicalBitmapIndexJoin(JoinType join_type, vector<JoinCondition> conditions,
 	                       string bitmap_index_schema, string bitmap_index_table_name, string bitmap_index_name,
-	                       idx_t bitmap_index_table_index, bool build_on_left,
+	                       idx_t bitmap_index_table_index, bool probe_on_left,
 	                       vector<idx_t> left_projection_map, vector<idx_t> right_projection_map,
 	                       vector<unique_ptr<BaseStatistics>> join_stats);
 

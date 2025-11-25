@@ -57,6 +57,7 @@ static BitmapIndex *FindBitmapIndexOnColumn(ClientContext &context, TableCatalog
 }
 
 // Helper function to recursively find LogicalGet in a subtree
+// the reason is that DuckDB might dynamically add compression projections ahead LogicalGet
 static LogicalGet* FindLogicalGet(LogicalOperator* op) {
 	if (!op) {
 		return nullptr;
@@ -146,6 +147,7 @@ static idx_t TraceBindingToLogicalGet(LogicalOperator &op, ColumnBinding binding
 	}
 }
 
+// Check if LogicalGet has bitmap index built on specific column
 static BitmapIndex *FindBitmapIndexOnJoinKey(ClientContext &context, LogicalOperator &subtree_root, LogicalGet &get, Expression &key_expr) {
 	// First check if the expression belongs to this subtree
 	if (!ExpressionBelongsToSubtree(key_expr, subtree_root)) {
@@ -314,20 +316,14 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		if (!has_equality || range_count > 0) {
 			// Only optimize equality joins without range conditions
 			// Continue to children
-			for (auto &child : plan->children) {
-				OptimizeRecursive(input, child);
-			}
-			return;
+			goto optimize_children;
 		}
 
 		// Check join type - only support certain types initially
 		if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT &&
 		    join.join_type != JoinType::SEMI && join.join_type != JoinType::ANTI) {
 			// Not supported yet
-			for (auto &child : plan->children) {
-				OptimizeRecursive(input, child);
-			}
-			return;
+			goto optimize_children;
 		}
 
 		// Check if children are LogicalGet (table scans)
@@ -341,10 +337,7 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 
 		if (!left_get || !right_get) {
 			// Could not find LogicalGet in children (may have other operators like Projection/Filter)
-			for (auto &child : plan->children) {
-				OptimizeRecursive(input, child);
-			}
-			return;
+			goto optimize_children;
 		}
 
 		// Check for bitmap indexes on join keys
@@ -365,10 +358,7 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		// Decision logic:
 		// 1. If neither table has bitmap index -> no optimization
 		if (!left_index && !right_index) {
-			for (auto &child : plan->children) {
-				OptimizeRecursive(input, child);
-			}
-			return;
+			goto optimize_children;
 		}
 
 		// 2. Get cardinalities for decision making
@@ -376,10 +366,9 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		idx_t right_cardinality = right_get->EstimateCardinality(input.context);
 
 		// 3. Decision: which side to use bitmap index, which side to build hash table
-		BitmapIndex *bitmap_index = nullptr;
-		idx_t bitmap_index_table_index = 0;
-		bool build_on_left = false;
-		string bitmap_index_schema;
+		idx_t bitmap_index_table_index = 0; // 0 -> index on left table; 1 -> index on right table
+		bool probe_on_left = false;
+		string bitmap_index_table_schema_name;
 		string bitmap_index_table_name;
 		string bitmap_index_name;
 
@@ -388,55 +377,37 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			// Probe side will scan the larger table
 			if (left_cardinality < right_cardinality) {
 				// Left is smaller - use bitmap index on left (build side)
-				bitmap_index = left_index;
-				bitmap_index_table_index = 0; // left
-				build_on_left = false; // build on right (probe side)
+				bitmap_index_table_index = 0; // using index of left table
+				probe_on_left = false; // probe the right table
 				auto left_table = left_get->GetTable();
-				bitmap_index_schema = left_table->schema.name;
+				bitmap_index_table_schema_name = left_table->schema.name;
 				bitmap_index_table_name = left_table->name;
 				bitmap_index_name = left_index->name;
 			} else {
 				// Right is smaller - use bitmap index on right (build side)
-				bitmap_index = right_index;
 				bitmap_index_table_index = 1; // right
-				build_on_left = true; // build on left (probe side)
+				probe_on_left = true; // build on left (probe side)
 				auto right_table = right_get->GetTable();
-				bitmap_index_schema = right_table->schema.name;
+				bitmap_index_table_schema_name = right_table->schema.name;
 				bitmap_index_table_name = right_table->name;
 				bitmap_index_name = right_index->name;
 			}
-		} else if (left_index) {
+		} 
+		else if (left_index) {
 			// Only left has index
-			// Check if right is much larger - if so, don't optimize
-			if (right_cardinality > left_cardinality * 10) {
-				// Right is too large, building hash table would be expensive
-				for (auto &child : plan->children) {
-					OptimizeRecursive(input, child);
-				}
-				return;
-			}
-			bitmap_index = left_index;
 			bitmap_index_table_index = 0;
-			build_on_left = false; // build on right (no index)
+			probe_on_left = false; // build on right (no index)
 			auto left_table = left_get->GetTable();
-			bitmap_index_schema = left_table->schema.name;
+			bitmap_index_table_schema_name = left_table->schema.name;
 			bitmap_index_table_name = left_table->name;
 			bitmap_index_name = left_index->name;
-		} else if (right_index) {
+		} 
+		else if (right_index) {
 			// Only right has index
-			// Check if left is much larger - if so, don't optimize
-			if (left_cardinality > right_cardinality * 10) {
-				// Left is too large, building hash table would be expensive
-				for (auto &child : plan->children) {
-					OptimizeRecursive(input, child);
-				}
-				return;
-			}
-			bitmap_index = right_index;
 			bitmap_index_table_index = 1;
-			build_on_left = true; // build on left (no index)
+			probe_on_left = true; // build on left (no index)
 			auto right_table = right_get->GetTable();
-			bitmap_index_schema = right_table->schema.name;
+			bitmap_index_table_schema_name = right_table->schema.name;
 			bitmap_index_table_name = right_table->name;
 			bitmap_index_name = right_index->name;
 		}
@@ -451,10 +422,7 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			}
 		}
 
-		// Deep copy join conditions to avoid binding issues
-		// When we move conditions, the expressions inside may have bindings that become invalid
-		// after subsequent optimizers modify the children structure. By deep copying, we ensure
-		// the expressions are independent and will be properly resolved by ResolveColumnBindings.
+		// Deep copy join conditions
 		vector<JoinCondition> conditions_copy;
 		conditions_copy.reserve(join.conditions.size());
 		for (auto &cond : join.conditions) {
@@ -469,16 +437,19 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 			conditions_copy.push_back(std::move(new_cond));
 		}
 
-		// Verify bitmap_index was set (should always be true at this point)
-		D_ASSERT(bitmap_index != nullptr);
-		(void)bitmap_index; // Suppress unused variable warning (used via bitmap_index_name)
-
 		// Create LogicalBitmapIndexJoin to replace the original join
-		// Use the copied conditions instead of moving the original ones
 		auto bitmap_join = make_uniq<LogicalBitmapIndexJoin>(
-		    join.join_type, std::move(conditions_copy), bitmap_index_schema, bitmap_index_table_name, bitmap_index_name,
-		    bitmap_index_table_index, build_on_left, join.left_projection_map, join.right_projection_map,
-		    std::move(join_stats_copy));
+		    join.join_type, // join type
+			std::move(conditions_copy), // join condition 
+			bitmap_index_table_schema_name, // schema name of the indexed table
+			bitmap_index_table_name, // name of the indexed table
+			bitmap_index_name, // name of the index
+		    bitmap_index_table_index, // left child -> 0, right child -> 0
+			probe_on_left, 
+			join.left_projection_map, // projections on left table [idx of columns]
+			join.right_projection_map, // projections on right table [idx of columns]
+		    std::move(join_stats_copy)
+		);
 
 		// Copy children
 		bitmap_join->children = std::move(plan->children);
@@ -487,6 +458,7 @@ static void OptimizeRecursive(OptimizerExtensionInput &input, unique_ptr<Logical
 		return;
 	}
 
+optimize_children:
 	// Recursively optimize children
 	for (auto &child : plan->children) {
 		OptimizeRecursive(input, child);
