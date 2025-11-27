@@ -9,6 +9,8 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_NAME=$(basename "$REPO_DIR")
 
 DUCKDB_BIN="${REPO_DIR}/build/release/duckdb"
+# Use DUCKDB_CMD for runtime invocation so we can pass -unsigned
+DUCKDB_CMD="${DUCKDB_BIN} -unsigned"
 EXTENSION_PATH="$(realpath "${REPO_DIR}/build/release/extension/bitmap_idx/bitmap_idx.duckdb_extension")"
 
 EXTENSION_NAME="bitmap_idx"
@@ -54,7 +56,7 @@ echo "----------------------------------------------"
 #10 , 21
 for q in {1..22}; do
     echo "Running Q${q} WITH extension..."
-    timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${WITH_DIR}/q${q}.out" 2>&1
+    timeout 1200s ${DUCKDB_CMD} ":memory:" <<EOF > "${WITH_DIR}/q${q}.out" 2>&1
 INSTALL '${EXTENSION_PATH}';
 LOAD '${EXTENSION_NAME}';
 INSTALL tpch;
@@ -79,7 +81,7 @@ PRAGMA tpch(${q});
 EOF
 
     echo "Running Q${q} BASELINE()..."
-    timeout 1200s "${DUCKDB_BIN}" ":memory:" <<EOF > "${BASE_DIR}/q${q}.out" 2>&1
+    timeout 1200s ${DUCKDB_CMD} ":memory:" <<EOF > "${BASE_DIR}/q${q}.out" 2>&1
 INSTALL tpch;
 LOAD tpch;
 CALL dbgen(sf=0.01);

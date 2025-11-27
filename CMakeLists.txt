@@ -36,8 +36,7 @@ find_package(roaring CONFIG REQUIRED)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+## Inherit C++ standard from top-level DuckDB build to avoid ODR mismatches
 
 project(${TARGET_NAME})
 add_subdirectory(src)
@@ -55,7 +54,27 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto ro
 
 
 install(
-  TARGETS ${EXTENSION_NAME}
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+    TARGETS ${EXTENSION_NAME}
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Prevent the static extension archive target from being linked into the
+# loadable extension target. Some DuckDB build configurations propagate the
+# `${EXTENSION_NAME}` static archive into the loadable target which can lead
+# to duplicate symbol/linker errors when both the core static library and the
+# extension archive end up on the same link line. Keep the static archive in
+# the build (so `build_static_extension` still works) but remove it from the
+# loadable target's LINK_LIBRARIES list.
+if(TARGET ${LOADABLE_EXTENSION_NAME})
+    get_target_property(_old_link_libs ${LOADABLE_EXTENSION_NAME} LINK_LIBRARIES)
+    if(_old_link_libs)
+        set(_new_link_libs)
+        foreach(_lib ${_old_link_libs})
+            if(NOT _lib STREQUAL ${EXTENSION_NAME})
+                list(APPEND _new_link_libs ${_lib})
+            endif()
+        endforeach()
+        set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINK_LIBRARIES "${_new_link_libs}")
+    endif()
+endif()
