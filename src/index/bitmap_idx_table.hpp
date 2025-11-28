@@ -113,6 +113,11 @@ public:
     // Get all row ids that have the given value (thread-safe)
     void GetRowsForValue(int value, std::vector<row_t> &out) const;
 
+    // Get a chunk of row ids for the given value starting at `offset` and
+    // writing at most `limit` entries into `out_buf`. Returns number of
+    // entries written. This avoids materializing the full list at once.
+    size_t GetRowsForValueChunk(int value, size_t offset, size_t limit, row_t *out_buf) const;
+
     void ClearRow(uint64_t rowid);
 
     template <class FUN>

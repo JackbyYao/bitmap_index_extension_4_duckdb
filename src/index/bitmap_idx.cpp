@@ -23,13 +23,20 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 class BitmapIndexScanState final : public IndexScanState {
 public:
+	// Two modes:
+	// - value_id >= 0 : stream rows for that value via BitmapTable::GetRowsForValueChunk
+	// - value_id < 0  : fallback materialized matches in `matches` (legacy behavior)
 	BitmapIndexScanState(const BitmapTable &table_p, vector<row_t> matches_p)
-	    : table(table_p), matches(std::move(matches_p)) {
+		: table(table_p), matches(std::move(matches_p)), value_id(-1), offset(0) {
+	}
+	BitmapIndexScanState(const BitmapTable &table_p, int value)
+		: table(table_p), value_id(value), offset(0) {
 	}
 
 	const BitmapTable &table;
-	vector<row_t> matches;
-	idx_t offset = 0;
+	vector<row_t> matches; // used only for materialized/full-scan mode
+	int value_id = -1;
+	idx_t offset = 0; // offset into matches or offset within the bitmap
 };
 
 //------------------------------------------------------------------------------
@@ -162,12 +169,12 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 			// Resolve string -> id
 			const string sval = StringValue::Get(*filter_value);
 			int id = LookupValueId(sval);
-			vector<row_t> matches;
 			if (id >= 0 && bitmap_table) {
-				bitmap_table->GetRowsForValue(id, matches);
+				// stream row ids for this value in chunks
+				return make_uniq<BitmapIndexScanState>(*bitmap_table, id);
 			}
-			// Return a scan state backed by the bitmap_table and the explicit matches
-			return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+			// no matching id -> return empty materialized state
+			return make_uniq<BitmapIndexScanState>(*bitmap_table, vector<row_t>());
 		} else if (type_id == LogicalTypeId::BOOLEAN || type_id == LogicalTypeId::TINYINT ||
 				   type_id == LogicalTypeId::UTINYINT || type_id == LogicalTypeId::SMALLINT ||
 				   type_id == LogicalTypeId::USMALLINT || type_id == LogicalTypeId::INTEGER ||
@@ -187,8 +194,8 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 					return InitializeScan();
 				}
 				int32_t key = static_cast<int32_t>(uv);
-				bitmap_table->GetRowsForValue(key, matches);
-				return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+				if (!bitmap_table) return nullptr;
+				return make_uniq<BitmapIndexScanState>(*bitmap_table, key);
 			} else {
 				// Signed numeric types and boolean
 				int64_t sv = filter_value->GetValue<int64_t>();
@@ -196,8 +203,8 @@ unique_ptr<IndexScanState> BitmapIndex::InitializeScan(const Value *filter_value
 					return InitializeScan();
 				}
 				int32_t key = static_cast<int32_t>(sv);
-				bitmap_table->GetRowsForValue(key, matches);
-				return make_uniq<BitmapIndexScanState>(*bitmap_table, std::move(matches));
+				if (!bitmap_table) return nullptr;
+				return make_uniq<BitmapIndexScanState>(*bitmap_table, key);
 			}
 		} else {
 			// For other filter types, fall back to full-scan for now
@@ -212,6 +219,20 @@ idx_t BitmapIndex::Scan(IndexScanState &state, Vector &result) const {
 	auto &scan_state = state.Cast<BitmapIndexScanState>();
 	auto row_ids = FlatVector::GetData<row_t>(result);
 	idx_t count = 0;
+
+	// Streaming path: if value_id >= 0, pull a chunk from the underlying BitmapTable
+	if (scan_state.value_id >= 0) {
+		size_t produced = scan_state.table.GetRowsForValueChunk(scan_state.value_id,
+															   static_cast<size_t>(scan_state.offset),
+															   STANDARD_VECTOR_SIZE,
+															   row_ids);
+		count = static_cast<idx_t>(produced);
+		scan_state.offset += produced;
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		return count;
+	}
+
+	// Fallback: materialized matches vector
 	while (scan_state.offset < scan_state.matches.size() && count < STANDARD_VECTOR_SIZE) {
 		row_ids[count++] = scan_state.matches[scan_state.offset++];
 	}
