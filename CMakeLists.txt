@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.5)
 
+# Force C++17 for extension build to match DuckDB core
+set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # Set extension name here
 set(TARGET_NAME bitmap_idx)
 
