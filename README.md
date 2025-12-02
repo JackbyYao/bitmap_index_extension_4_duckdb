@@ -4,8 +4,22 @@ This repository is based on https://github.com/duckdb/extension-template, check 
 
 ---
 
-This extension, BitmapIdx, allow you to ... <extension_goal>.
+This extension, BitmapIdx, allow you to create, and use bitmap index for duckdb.
 
+This branch we have modified DuckDB source code and redirected the submodule to our fork.
+IMPORTANT: make sure the extension AND DuckDB is build with C++17 Standard. (Specially important for GCC compiler)
+
+To run the tests, after building duckdb, run the scripts under test/
+    for the scaling test, run benchmark-tpch-scale.sh
+    for the thread test, run benchmark-tpch-threads.sh
+        the output logs are in benchmark-results/
+
+This branch supports:
+    integer columns , string(VARCHAR) columns
+    equal selection predicate ( '=' )
+
+Known issue:
+    This build is not very suitable for JOIN intensive queries, for example Query 10, 21 in TPCH. Performance degradation is observed.
 
 ## Building
 ### Managing dependencies
@@ -35,16 +49,13 @@ The main binaries that will be built are:
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`.
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `bitmap_idx()` that takes a string arguments and returns a string:
-```
-D select bitmap_idx('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ BitmapIdx Jane 🐥 │
-└───────────────┘
-```
+To build bitmap index on a column, use
+    CREATE INDEX ON tbl_name USING BITMAP (col_name);
+
+Then, when a query can use the index on that column, the plan will be automatically configured.
+    For example, running:
+        SELECT item ON tbl_name WHERE predicate = value;
+    will trigger using the built index.
 
 ## Running the tests
 Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
