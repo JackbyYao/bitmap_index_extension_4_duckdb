@@ -12,21 +12,24 @@ IMPORTANT: make sure the extension AND DuckDB is build with C++17 Standard. (Spe
 
 To run the tests, after building duckdb, run the scripts under test/
 
-    for the scaling test, run benchmark-tpch-scale.sh
+for the scaling test, run benchmark-tpch-scale.sh
 
-    for the thread test, run benchmark-tpch-threads.sh
+for the thread test, run benchmark-tpch-threads.sh
 
-        the output logs are in benchmark-results/
+the output logs are in benchmark-results/
 
 This branch supports:
 
-    integer columns , string(VARCHAR) columns
+integer columns , string(VARCHAR) columns
 
-    equal selection predicate ( '=' )
+equal selection predicate ( '=' )
+
+
+NOTE: please git clone and pull the newest version of branch "milestone"
 
 Known issue:
 
-    This build is not very suitable for JOIN intensive queries, for example Query 10, 21 in TPCH. Performance degradation is observed.
+This build is not very suitable for JOIN intensive queries, for example Query 10, 21 in TPCH. Performance degradation is observed.
 
 ## Building
 ### Managing dependencies
